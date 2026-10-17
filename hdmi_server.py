@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import os
 import io
-import re
 import glob
 import time
 import argparse
@@ -9,43 +8,29 @@ import threading
 import subprocess
 from urllib.parse import urlparse, parse_qs
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from PIL import Image
 
 PORT = 1111
+USER = "cernytom"
+RUNTIME_DIR = "/run/user/1000"
 
-# --- PROSTŘEDÍ PRO WAYLAND I X11 ---
-def get_display_env():
-    """Nastaví prostředí pro běh grafických nástrojů z background služby."""
-    env = os.environ.copy()
-    env["DISPLAY"] = ":0"
-    
-    # Detekce Wayland socketu a runtime adresáře
-    uid = os.getuid()
-    runtime_dir = f"/run/user/{uid}" if os.path.exists(f"/run/user/{uid}") else "/run/user/1000"
-    env["XDG_RUNTIME_DIR"] = runtime_dir
-    
-    for wl in ["wayland-1", "wayland-0"]:
-        if os.path.exists(os.path.join(runtime_dir, wl)):
-            env["WAYLAND_DISPLAY"] = wl
-            break
-
-    # X11 autorizace
-    for path in ["/home/cernytom/.Xauthority", "/home/pi/.Xauthority", os.path.expanduser("~/.Xauthority")]:
-        if os.path.exists(path):
-            env["XAUTHORITY"] = path
-            break
-    return env
+# --- INTERNÍ SLEDOVÁNÍ POZICE MYŠI ---
+screen_width = 1920
+screen_height = 1080
+cur_x = screen_width // 2
+cur_y = screen_height // 2
+pos_lock = threading.Lock()
 
 # --- OVLÁDÁNÍ ZVUKU ---
 def refresh_audio():
-    """Znovu inicializuje a probudí zvukové rozhraní HDMI."""
-    print("[AUDIO] Obnovuji zvukové subsystémy...")
+    print("[AUDIO] Obnovuji zvuk...")
     commands = [
         "udevadm trigger --subsystem-match=sound",
         "alsactl init",
         "alsactl restore",
-        "pkill -x wireplumber",
-        "pkill -x pipewire",
-        "pulseaudio -k"
+        f"runuser -u {USER} -- pkill -x wireplumber",
+        f"runuser -u {USER} -- pkill -x pipewire",
+        f"runuser -u {USER} -- pulseaudio -k"
     ]
     for cmd in commands:
         try:
@@ -54,11 +39,11 @@ def refresh_audio():
             pass
 
     try:
-        cmd_sink = "pactl list sinks short | grep -i hdmi | head -n 1 | awk '{print $2}'"
+        cmd_sink = f"runuser -u {USER} -- env XDG_RUNTIME_DIR={RUNTIME_DIR} pactl list sinks short | grep -i hdmi | head -n 1 | awk '{{print $2}}'"
         res = subprocess.run(cmd_sink, shell=True, capture_output=True, text=True)
         hdmi_sink = res.stdout.strip()
         if hdmi_sink:
-            subprocess.run(f"pactl set-default-sink {hdmi_sink}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(f"runuser -u {USER} -- env XDG_RUNTIME_DIR={RUNTIME_DIR} pactl set-default-sink {hdmi_sink}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
     print("[AUDIO] Zvuk obnoven.")
@@ -97,7 +82,7 @@ def get_hdmi_status() -> str:
     except Exception:
         return "neznámý"
 
-# --- OVLÁDÁNÍ MYŠI (EVDEV / XDOTOOL) ---
+# --- OVLÁDÁNÍ MYŠI (EVDEV) ---
 try:
     import evdev
     from evdev import UInput, ecodes as e
@@ -115,20 +100,20 @@ class MouseController:
                     e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE]
                 }
                 self.ui = UInput(cap, name="RPi-Web-Touchpad")
-                print("[MOUSE] Inicializován uinput/evdev ovladač myši.")
-            except Exception:
-                pass
+                print("[MOUSE] Úspěšně vytvořen uinput ovladač myši.")
+            except Exception as ex:
+                print(f"[MOUSE] evdev selhal: {ex}")
 
     def move(self, dx: int, dy: int):
+        global cur_x, cur_y
+        with pos_lock:
+            cur_x = max(0, min(screen_width, cur_x + dx))
+            cur_y = max(0, min(screen_height, cur_y + dy))
+
         if self.ui:
             self.ui.write(e.EV_REL, e.REL_X, dx)
             self.ui.write(e.EV_REL, e.REL_Y, dy)
             self.ui.syn()
-        else:
-            subprocess.run(
-                ["xdotool", "mousemove_relative", "--", str(dx), str(dy)],
-                env=get_display_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
 
     def click(self, button: str = "left"):
         if self.ui:
@@ -137,87 +122,49 @@ class MouseController:
             self.ui.syn()
             self.ui.write(e.EV_KEY, btn, 0)
             self.ui.syn()
-        else:
-            btn_num = "1" if button == "left" else "3"
-            subprocess.run(
-                ["xdotool", "click", btn_num],
-                env=get_display_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
 
 mouse = MouseController()
 
-# --- SNÍMÁNÍ OBRAZOVKY A CENTROVÁNÍ NA MYŠ ---
-try:
-    from PIL import Image
-    HAS_PIL = True
-except ImportError:
-    HAS_PIL = False
-
+# --- SNÍMÁNÍ OBRAZOVKY PŘES GRIM (WAYLAND / LABWC) ---
 last_capture_time = 0
 cached_image_bytes = None
 CROP_WIDTH = 500
 CROP_HEIGHT = 400
 
-def get_mouse_position():
-    """Získá aktuální pozici myši pomocí xdotool."""
-    try:
-        res = subprocess.run(
-            ["xdotool", "getmouselocation"],
-            env=get_display_env(), capture_output=True, text=True, timeout=1
-        )
-        match = re.search(r"x:(\d+)\s+y:(\d+)", res.stdout)
-        if match:
-            return int(match.group(1)), int(match.group(2))
-    except Exception:
-        pass
-    return None, None
-
 def capture_centered_crop():
-    """Pořídí snímek (přes grim pro Wayland nebo scrot pro X11) a ořízne na myš."""
-    global last_capture_time, cached_image_bytes
+    global last_capture_time, cached_image_bytes, screen_width, screen_height
 
     now = time.time()
-    # Cache 250ms pro optimalizaci výkonu RPi 3
-    if cached_image_bytes and (now - last_capture_time < 0.25):
+    if cached_image_bytes and (now - last_capture_time < 0.20):
         return cached_image_bytes
 
-    if not HAS_PIL:
-        return None
-
     temp_raw = "/dev/shm/rpi_raw_screen.jpg"
-    env = get_display_env()
 
-    # Smazat starý snímek, aby nezůstal viset
+    # Smazat starý soubor
     if os.path.exists(temp_raw):
         try:
             os.remove(temp_raw)
         except OSError:
             pass
 
+    # Spustit grim pod uživatelem cernytom s jeho Wayland relací
+    if os.getuid() == 0:
+        cmd = ["runuser", "-u", USER, "--", "env", f"XDG_RUNTIME_DIR={RUNTIME_DIR}", "grim", "-q", "50", temp_raw]
+    else:
+        env = os.environ.copy()
+        env["XDG_RUNTIME_DIR"] = RUNTIME_DIR
+        cmd = ["grim", "-q", "50", temp_raw]
+
     try:
-        # 1. Pokus: grim (pro Wayland na Raspberry Pi OS Bookworm)
-        ret = subprocess.run(
-            ["grim", "-q", "50", temp_raw],
-            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2
-        )
-
-        # 2. Pokus: pokud grim selhal nebo není nainstalován, použijeme scrot (pro X11)
-        if ret.returncode != 0 or not os.path.exists(temp_raw):
-            subprocess.run(
-                ["scrot", "-z", "-o", "-q", "50", temp_raw],
-                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2
-            )
-
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
         if not os.path.exists(temp_raw):
             return None
 
-        mx, my = get_mouse_position()
         img = Image.open(temp_raw)
-        img_w, img_h = img.size
+        screen_width, screen_height = img.size
 
-        # Pokud xdotool nenašel pozici, vycentrujeme na střed obrazovky
-        if mx is None or my is None:
-            mx, my = img_w // 2, img_h // 2
+        with pos_lock:
+            mx, my = cur_x, cur_y
 
         canvas = Image.new("RGB", (CROP_WIDTH, CROP_HEIGHT), (20, 24, 33))
 
@@ -228,8 +175,8 @@ def capture_centered_crop():
 
         src_x1 = max(0, crop_x1)
         src_y1 = max(0, crop_y1)
-        src_x2 = min(img_w, crop_x2)
-        src_y2 = min(img_h, crop_y2)
+        src_x2 = min(screen_width, crop_x2)
+        src_y2 = min(screen_height, crop_y2)
 
         if src_x2 > src_x1 and src_y2 > src_y1:
             cropped = img.crop((src_x1, src_y1, src_x2, src_y2))
@@ -335,7 +282,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             top: 0;
             left: 0;
             pointer-events: none;
-            opacity: 0.9;
         }
         .crosshair {
             position: absolute;
@@ -463,7 +409,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             };
             nextImg.src = '/api/screen/crop?t=' + Date.now();
         }
-        setInterval(updateScreen, 450);
+        setInterval(updateScreen, 400);
 
         function toggleStream() {
             streamEnabled = !streamEnabled;
@@ -511,7 +457,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             if (dist < 8 && duration < 250) {
                 sendClick('left');
             }
-            setTimeout(updateScreen, 60);
+            setTimeout(updateScreen, 50);
         }, { passive: false });
 
         function sendClick(btn) {
@@ -629,13 +575,12 @@ class ServerHandler(BaseHTTPRequestHandler):
         print(f"[HTTP] {self.address_string()} - {format % args}")
 
 def run_server(port):
-    # Automatické vypnutí displeje při spuštění
     print("[STARTUP] Automatické vypínání HDMI monitoru...")
     set_hdmi(False)
 
     server_address = ("", port)
     httpd = ThreadingHTTPServer(server_address, ServerHandler)
-    print(f"[SERVER] Běží na portu {port} (Touchpad + Screen Crop + HDMI)")
+    print(f"[SERVER] Běží na portu {port} (Labwc/Wayland Touchpad + Centered Screen)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
