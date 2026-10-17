@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import os
 import io
-import glob
 import time
 import argparse
 import threading
@@ -14,20 +13,28 @@ PORT = 1111
 USER = "cernytom"
 RUNTIME_DIR = "/run/user/1000"
 
-# --- ZJIŠTĚNÍ SKUTEČNÉHO ROZLIŠENÍ OBRAZOVKY ---
-def get_screen_resolution():
+# --- ZJIŠTĚNÍ SKUTEČNÉHO ROZLIŠENÍ PLOCHY PŘES GRIM ---
+def detect_desktop_resolution():
+    temp = "/dev/shm/rpi_detect.png"
     try:
-        for p in glob.glob("/sys/class/drm/*HDMI*/modes"):
-            with open(p) as f:
-                line = f.readline().strip()
-                if "x" in line:
-                    parts = line.split("x")
-                    return int(parts[0]), int(parts[1])
-    except Exception:
-        pass
+        cmd = [
+            "runuser", "-u", USER, "--",
+            "env", f"XDG_RUNTIME_DIR={RUNTIME_DIR}", "WAYLAND_DISPLAY=wayland-0",
+            "grim", temp
+        ] if os.getuid() == 0 else ["grim", temp]
+        
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+        if os.path.exists(temp):
+            img = Image.open(temp)
+            w, h = img.size
+            os.remove(temp)
+            print(f"[SCREEN] Zjištěno přesné rozlišení plochy: {w}x{h}")
+            return w, h
+    except Exception as e:
+        print(f"[SCREEN] Detekce selhala ({e}), použito výchozí 1920x1080")
     return 1920, 1080
 
-screen_width, screen_height = get_screen_resolution()
+screen_width, screen_height = detect_desktop_resolution()
 cur_x = screen_width // 2
 cur_y = screen_height // 2
 pos_lock = threading.Lock()
@@ -68,6 +75,7 @@ def find_hdmi_status_path():
     default_path = "/sys/class/drm/card0-HDMI-A-1/status"
     if os.path.exists(default_path):
         return default_path
+    import glob
     matches = glob.glob("/sys/class/drm/*HDMI*/status")
     return matches[0] if matches else default_path
 
@@ -151,7 +159,7 @@ class MouseController:
 
 mouse = MouseController()
 
-# --- SNÍMÁNÍ OBRAZOVKY S PŘIROZENÝM POMĚREM STRAN ---
+# --- SNÍMÁNÍ OBRAZOVKY: MYŠ JE VŽDY 100% VYCENTROVANÁ ---
 last_capture_time = 0
 cached_image_bytes = None
 
@@ -164,37 +172,56 @@ def capture_centered_crop(req_w, req_h):
 
     temp_raw = "/dev/shm/rpi_crop.png"
 
-    # Zachováme přesný poměr stran podle obrazovky mobilu
+    # Rozměry přesně podle okna touchpadu na telefonu
     crop_w = max(240, min(screen_width, req_w))
     crop_h = max(240, min(screen_height, req_h))
 
     with pos_lock:
         mx, my = cur_x, cur_y
 
-    gx = max(0, min(screen_width - crop_w, mx - crop_w // 2))
-    gy = max(0, min(screen_height - crop_h, my - crop_h // 2))
-    geom = f"{gx},{gy} {crop_w}x{crop_h}"
+    # Ideální souřadnice výřezu tak, aby (mx, my) bylo v crop_w//2, crop_h//2
+    ideal_x1 = mx - crop_w // 2
+    ideal_y1 = my - crop_h // 2
+    ideal_x2 = ideal_x1 + crop_w
+    ideal_y2 = ideal_y1 + crop_h
 
-    if os.getuid() == 0:
-        cmd = [
-            "runuser", "-u", USER, "--",
-            "env", f"XDG_RUNTIME_DIR={RUNTIME_DIR}", "WAYLAND_DISPLAY=wayland-0",
-            "grim", "-c", "-g", geom, temp_raw
-        ]
-    else:
-        env = os.environ.copy()
-        env["XDG_RUNTIME_DIR"] = RUNTIME_DIR
-        env["WAYLAND_DISPLAY"] = "wayland-0"
-        cmd = ["grim", "-c", "-g", geom, temp_raw]
+    # Reálný průnik s plochou monitoru
+    src_x1 = max(0, ideal_x1)
+    src_y1 = max(0, ideal_y1)
+    src_x2 = min(screen_width, ideal_x2)
+    src_y2 = min(screen_height, ideal_y2)
+
+    grab_w = src_x2 - src_x1
+    grab_h = src_y2 - src_y1
+
+    if grab_w <= 0 or grab_h <= 0:
+        return cached_image_bytes
+
+    geom = f"{src_x1},{src_y1} {grab_w}x{grab_h}"
+
+    cmd = [
+        "runuser", "-u", USER, "--",
+        "env", f"XDG_RUNTIME_DIR={RUNTIME_DIR}", "WAYLAND_DISPLAY=wayland-0",
+        "grim", "-c", "-g", geom, temp_raw
+    ] if os.getuid() == 0 else ["grim", "-c", "-g", geom, temp_raw]
 
     try:
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1)
         if not os.path.exists(temp_raw):
             return cached_image_bytes
 
-        img = Image.open(temp_raw)
+        cropped_img = Image.open(temp_raw)
+
+        # Plátno v barvě pozadí (pro okraje za monitorem)
+        canvas = Image.new("RGB", (crop_w, crop_h), (15, 23, 42))
+
+        # Umístění snímku tak, aby myš byla VŽDY v přesném středu plátna
+        paste_x = src_x1 - ideal_x1
+        paste_y = src_y1 - ideal_y1
+        canvas.paste(cropped_img, (paste_x, paste_y))
+
         buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="JPEG", quality=55, optimize=False)
+        canvas.save(buf, format="JPEG", quality=55, optimize=False)
         cached_image_bytes = buf.getvalue()
         last_capture_time = now
         return cached_image_bytes
@@ -207,7 +234,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="cs">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>RPi Remote Control</title>
     <style>
         * {
@@ -215,22 +242,24 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             user-select: none;
             -webkit-user-select: none;
         }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background-color: #0f172a;
-            color: #f8fafc;
+        html, body {
+            height: 100%;
+            height: 100dvh; /* Přesná dynamická výška mobilu bez překrytí lištou */
             margin: 0;
-            padding: 8px;
-            height: 100vh;
+            padding: 6px;
+            background-color: #0b1120;
+            color: #f8fafc;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            overflow: hidden;
             display: flex;
             flex-direction: column;
-            overflow: hidden;
         }
         .header {
+            flex-shrink: 0;
             display: flex;
             flex-direction: column;
             gap: 6px;
-            margin-bottom: 8px;
+            margin-bottom: 6px;
         }
         .header-top {
             display: flex;
@@ -269,17 +298,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .btn-center { background-color: #f59e0b; }
 
         #touchpad {
-            flex: 1;
+            flex: 1 1 0; /* Zaručí vyplnění přesně zbylého prostoru */
+            min-height: 0;
             position: relative;
-            background-color: #000;
-            border-radius: 16px;
-            border: 2px solid #475569;
+            background-color: #0f172a;
+            border-radius: 14px;
+            border: 2px solid #334155;
             overflow: hidden;
             touch-action: none;
             cursor: default;
-            display: flex;
-            align-items: center;
-            justify-content: center;
         }
         #touchpad.active {
             border-color: #38bdf8;
@@ -287,23 +314,24 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         #screen-view {
             width: 100%;
             height: 100%;
-            object-fit: cover; /* Přirozený poměr stran bez natahování */
+            object-fit: cover;
             position: absolute;
             top: 0;
             left: 0;
             pointer-events: none;
         }
         .mouse-buttons {
+            flex-shrink: 0; /* ZABRÁNÍ SCHOVÁNÍ SPODNÍCH TLAČÍTEK */
             display: flex;
             gap: 10px;
-            margin-top: 8px;
-            height: 55px;
+            margin-top: 6px;
+            height: 52px;
         }
         .btn-mouse {
             flex: 1;
-            background: #334155;
+            background: #1e293b;
             color: white;
-            border: none;
+            border: 1px solid #475569;
             border-radius: 12px;
             font-size: 1rem;
             font-weight: 600;
@@ -311,7 +339,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             cursor: pointer;
         }
         .btn-mouse:active {
-            background: #64748b;
+            background: #38bdf8;
+            color: black;
         }
     </style>
 </head>
@@ -377,7 +406,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             clearTimeout(fetchWatchdog);
             fetchWatchdog = setTimeout(() => { isFetchingScreen = false; }, 800);
 
-            // Zjištění reálného rozměru plochy v mobilu pro zachování poměru stran
             const w = Math.round(pad.clientWidth) || 360;
             const h = Math.round(pad.clientHeight) || 480;
 
@@ -395,7 +423,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         function recenterMouse() {
             fetch('/api/mouse/center', { method: 'POST' })
-                .then(() => setTimeout(updateScreen, 50));
+                .then(() => setTimeout(updateScreen, 60));
         }
 
         function toggleStream() {
@@ -409,7 +437,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        // Dotyk
+        // Dotykové ovládání pro mobil
         pad.addEventListener("touchstart", (e) => {
             e.preventDefault();
             pad.classList.add("active");
@@ -440,7 +468,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             setTimeout(updateScreen, 40);
         }, { passive: false });
 
-        // Myš (PC)
+        // Ovládání pro PC myš
         pad.addEventListener("mousedown", (e) => {
             isMouseDown = true;
             pad.classList.add("active");
@@ -601,7 +629,7 @@ def run_server(port):
 
     server_address = ("", port)
     httpd = ThreadingHTTPServer(server_address, ServerHandler)
-    print(f"[SERVER] Běží na portu {port} (Nedeformovaný 1:1 náhled)")
+    print(f"[SERVER] Běží na portu {port} (Garantované centrování + fix spodních tlačítek)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
