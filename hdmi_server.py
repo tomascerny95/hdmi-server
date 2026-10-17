@@ -14,16 +14,25 @@ PORT = 1111
 USER = "cernytom"
 RUNTIME_DIR = "/run/user/1000"
 
-# --- SLEDOVÁNÍ POZICE MYŠI ---
-screen_width = 1920
-screen_height = 1080
+# --- ZJIŠTĚNÍ SKUTEČNÉHO ROZLIŠENÍ OBRAZOVKY ---
+def get_screen_resolution():
+    try:
+        for p in glob.glob("/sys/class/drm/*HDMI*/modes"):
+            with open(p) as f:
+                line = f.readline().strip()
+                if "x" in line:
+                    parts = line.split("x")
+                    return int(parts[0]), int(parts[1])
+    except Exception:
+        pass
+    return 1920, 1080
+
+screen_width, screen_height = get_screen_resolution()
 cur_x = screen_width // 2
 cur_y = screen_height // 2
 pos_lock = threading.Lock()
 
-# Rozměry hledáčku
-CROP_WIDTH = 480
-CROP_HEIGHT = 360
+print(f"[SCREEN] Detekováno rozlišení obrazovky: {screen_width}x{screen_height}")
 
 # --- OVLÁDÁNÍ ZVUKU ---
 def refresh_audio():
@@ -126,42 +135,64 @@ class MouseController:
             self.ui.write(e.EV_KEY, btn, 0)
             self.ui.syn()
 
+    def recenter(self):
+        """Hardwarová kalibrace: hodí myš do rohu 0,0 a pak přesně na střed."""
+        global cur_x, cur_y
+        with pos_lock:
+            cur_x = screen_width // 2
+            cur_y = screen_height // 2
+
+        if self.ui:
+            # Zajet do levého horního rohu (-3000, -3000)
+            for _ in range(3):
+                self.ui.write(e.EV_REL, e.REL_X, -1000)
+                self.ui.write(e.EV_REL, e.REL_Y, -1000)
+                self.ui.syn()
+                time.sleep(0.01)
+            # Skočit na střed obrazovky
+            self.ui.write(e.EV_REL, e.REL_X, screen_width // 2)
+            self.ui.write(e.EV_REL, e.REL_Y, screen_height // 2)
+            self.ui.syn()
+        print(f"[MOUSE] Kalibrace: Myš vycentrována na ({cur_x}, {cur_y})")
+
 mouse = MouseController()
 
-# --- ULTRA RYCHLÉ SNÍMÁNÍ VÝŘEZU (GRIM -G) ---
+# --- SNÍMÁNÍ OBRAZOVKY S PŘESNÝM POMĚREM STRAN ---
 last_capture_time = 0
 cached_image_bytes = None
 
-def capture_centered_crop():
+def capture_centered_crop(req_w, req_h):
     global last_capture_time, cached_image_bytes
 
     now = time.time()
-    # Povolit až cca 15 FPS
     if cached_image_bytes and (now - last_capture_time < 0.06):
         return cached_image_bytes
 
     temp_raw = "/dev/shm/rpi_crop.png"
 
+    # Omezíme rozměry na rozumné maximum pro výkon RPi 3
+    crop_w = max(320, min(560, req_w))
+    crop_h = max(240, min(480, req_h))
+
     with pos_lock:
         mx, my = cur_x, cur_y
 
-    # Spočítat ořez a omezit na okraje obrazovky
-    gx = max(0, min(screen_width - CROP_WIDTH, mx - CROP_WIDTH // 2))
-    gy = max(0, min(screen_height - CROP_HEIGHT, my - CROP_HEIGHT // 2))
-    geom = f"{gx},{gy} {CROP_WIDTH}x{CROP_HEIGHT}"
+    gx = max(0, min(screen_width - crop_w, mx - crop_w // 2))
+    gy = max(0, min(screen_height - crop_h, my - crop_h // 2))
+    geom = f"{gx},{gy} {crop_w}x{crop_h}"
 
-    # grim fotí POUZE daný výřez 480x360 - extrémně rychlé!
+    # PARAMETR -c ZAJISTÍ VYFOCENÍ SKUTEČNÉ ŠIPKY MYŠI
     if os.getuid() == 0:
         cmd = [
             "runuser", "-u", USER, "--",
             "env", f"XDG_RUNTIME_DIR={RUNTIME_DIR}", "WAYLAND_DISPLAY=wayland-0",
-            "grim", "-g", geom, temp_raw
+            "grim", "-c", "-g", geom, temp_raw
         ]
     else:
         env = os.environ.copy()
         env["XDG_RUNTIME_DIR"] = RUNTIME_DIR
         env["WAYLAND_DISPLAY"] = "wayland-0"
-        cmd = ["grim", "-g", geom, temp_raw]
+        cmd = ["grim", "-c", "-g", geom, temp_raw]
 
     try:
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1)
@@ -242,6 +273,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .btn-off { background-color: #dc2626; }
         .btn-audio { background-color: #2563eb; }
         .btn-stream { background-color: #7c3aed; }
+        .btn-center { background-color: #f59e0b; }
 
         #touchpad {
             flex: 1;
@@ -262,7 +294,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         #screen-view {
             width: 100%;
             height: 100%;
-            object-fit: cover;
+            object-fit: fill; /* Přesné vyplnění bez ořezu */
             position: absolute;
             top: 0;
             left: 0;
@@ -270,41 +302,30 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
         .crosshair {
             position: absolute;
-            width: 24px;
-            height: 24px;
+            width: 20px;
+            height: 20px;
             pointer-events: none;
             z-index: 10;
         }
         .crosshair::before {
             content: '';
             position: absolute;
-            top: 11px;
+            top: 9px;
             left: 0;
-            width: 24px;
+            width: 20px;
             height: 2px;
             background: #ef4444;
-            box-shadow: 0 0 4px #000;
+            box-shadow: 0 0 3px #000;
         }
         .crosshair::after {
             content: '';
             position: absolute;
             top: 0;
-            left: 11px;
+            left: 9px;
             width: 2px;
-            height: 24px;
+            height: 20px;
             background: #ef4444;
-            box-shadow: 0 0 4px #000;
-        }
-        .touchpad-hint {
-            position: absolute;
-            bottom: 8px;
-            font-size: 0.75rem;
-            background: rgba(15, 23, 42, 0.75);
-            padding: 4px 10px;
-            border-radius: 12px;
-            color: #cbd5e1;
-            pointer-events: none;
-            z-index: 10;
+            box-shadow: 0 0 3px #000;
         }
         .mouse-buttons {
             display: flex;
@@ -332,7 +353,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="header">
         <div class="header-top">
             <div class="status-badge">HDMI: __STATUS_TEXT__</div>
-            <button class="btn-action btn-stream" id="btn-toggle-stream" onclick="toggleStream()">👁️ Obraz: ZAP</button>
+            <div style="display:flex; gap:6px;">
+                <button class="btn-action btn-center" onclick="recenterMouse()">🎯 Střed</button>
+                <button class="btn-action btn-stream" id="btn-toggle-stream" onclick="toggleStream()">👁️ Obraz</button>
+            </div>
         </div>
         <div class="action-buttons">
             <a href="/hdmi/on" class="btn-action btn-on">Zapnout</a>
@@ -342,9 +366,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
 
     <div id="touchpad">
-        <img id="screen-view" src="/api/screen/crop" alt="">
+        <img id="screen-view" src="/api/screen/crop?w=480&h=360" alt="">
         <div class="crosshair"></div>
-        <div class="touchpad-hint">Křížek = myš</div>
     </div>
 
     <div class="mouse-buttons">
@@ -369,7 +392,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         let isSending = false;
         let isMouseDown = false;
 
-        // Odesílání pohybu (40x za sekundu)
         function flushMove() {
             if ((accX !== 0 || accY !== 0) && !isSending) {
                 const x = accX;
@@ -383,13 +405,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
         setInterval(flushMove, 25);
 
-        // Zrychlená obnova hledáčku (~8 FPS) s watchdogem proti zaseknutí
+        // Zjištění přesných rozměrů touchpadu pro 1:1 zobrazení
         function updateScreen() {
             if (!streamEnabled || isFetchingScreen) return;
             isFetchingScreen = true;
 
             clearTimeout(fetchWatchdog);
             fetchWatchdog = setTimeout(() => { isFetchingScreen = false; }, 800);
+
+            const w = Math.round(pad.clientWidth) || 480;
+            const h = Math.round(pad.clientHeight) || 360;
 
             const nextImg = new Image();
             nextImg.onload = () => {
@@ -399,24 +424,27 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             nextImg.onerror = () => {
                 isFetchingScreen = false;
             };
-            nextImg.src = '/api/screen/crop?t=' + Date.now();
+            nextImg.src = `/api/screen/crop?w=${w}&h=${h}&t=${Date.now()}`;
         }
         setInterval(updateScreen, 120);
+
+        function recenterMouse() {
+            fetch('/api/mouse/center', { method: 'POST' })
+                .then(() => setTimeout(updateScreen, 50));
+        }
 
         function toggleStream() {
             streamEnabled = !streamEnabled;
             if (streamEnabled) {
-                btnToggleStream.innerText = "👁️ Obraz: ZAP";
                 btnToggleStream.style.backgroundColor = "#7c3aed";
                 screenView.style.display = "block";
             } else {
-                btnToggleStream.innerText = "👁️ Obraz: VYP";
                 btnToggleStream.style.backgroundColor = "#475569";
                 screenView.style.display = "none";
             }
         }
 
-        // --- DOTYK (MOBIL) ---
+        // Dotyk
         pad.addEventListener("touchstart", (e) => {
             e.preventDefault();
             pad.classList.add("active");
@@ -447,7 +475,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             setTimeout(updateScreen, 40);
         }, { passive: false });
 
-        // --- MYŠ (PC S WINDOWS) ---
+        // Myš (PC)
         pad.addEventListener("mousedown", (e) => {
             isMouseDown = true;
             pad.classList.add("active");
@@ -514,7 +542,14 @@ class ServerHandler(BaseHTTPRequestHandler):
         if path == "/":
             self._serve_dashboard()
         elif path == "/api/screen/crop":
-            data = capture_centered_crop()
+            params = parse_qs(parsed.query)
+            try:
+                w = int(params.get("w", [480])[0])
+                h = int(params.get("h", [360])[0])
+            except Exception:
+                w, h = 480, 360
+
+            data = capture_centered_crop(w, h)
             if data:
                 self.send_response(200)
                 self.send_header("Content-Type", "image/jpeg")
@@ -553,6 +588,10 @@ class ServerHandler(BaseHTTPRequestHandler):
         elif path == "/api/mouse/click":
             btn = params.get("btn", ["left"])[0]
             mouse.click(btn)
+            self._send_status(204)
+
+        elif path == "/api/mouse/center":
+            mouse.recenter()
             self._send_status(204)
 
         elif path == "/api/audio/refresh":
@@ -597,7 +636,7 @@ def run_server(port):
 
     server_address = ("", port)
     httpd = ThreadingHTTPServer(server_address, ServerHandler)
-    print(f"[SERVER] Běží na portu {port} (Zrychlený hledáček grim -g)")
+    print(f"[SERVER] Běží na portu {port} (1:1 hledáček s reálným kurzorem)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
