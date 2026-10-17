@@ -1,149 +1,181 @@
 #!/usr/bin/env python3
-"""
-HDMI Controller Server
-Lightweight HTTP server for controlling HDMI output on Linux / Raspberry Pi.
-"""
-
-import argparse
-import logging
 import os
-import subprocess
-import sys
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+import glob
+import argparse
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-DEFAULT_PORT = 1111
-DEFAULT_DEVICE = "/sys/class/drm/card0-HDMI-A-1/status"
+# Výchozí port
+PORT = 1111
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+def find_hdmi_status_path():
+    """Najde cestu k DRM statusu pro HDMI výstup v systému."""
+    default_path = "/sys/class/drm/card0-HDMI-A-1/status"
+    if os.path.exists(default_path):
+        return default_path
+    
+    # Hledání alternativních HDMI výstupů (např. card1 nebo HDMI-A-2)
+    matches = glob.glob("/sys/class/drm/*HDMI*/status")
+    if matches:
+        return matches[0]
+    
+    return default_path
 
-HTML_PAGE = """<!DOCTYPE html>
+HDMI_STATUS_PATH = find_hdmi_status_path()
+
+def set_hdmi(enable: bool) -> bool:
+    """Zapne nebo vypne HDMI zápisem do DRM sysfs."""
+    state_str = "on" if enable else "off"
+    try:
+        with open(HDMI_STATUS_PATH, "w") as f:
+            f.write(state_str + "\n")
+        print(f"[HDMI] Monitor úspěšně přepnut do stavu: {state_str.upper()} ({HDMI_STATUS_PATH})")
+        return True
+    except PermissionError:
+        print(f"[CHYBA] Nedostatečná práva pro zápis do {HDMI_STATUS_PATH}. Spusťte jako root/sudo.")
+    except Exception as e:
+        print(f"[CHYBA] Zápis do {HDMI_STATUS_PATH} selhal: {e}")
+    return False
+
+def get_hdmi_status() -> str:
+    """Přečte aktuální stav HDMI konektoru."""
+    try:
+        with open(HDMI_STATUS_PATH, "r") as f:
+            return f.read().strip()
+    except Exception:
+        return "neznámý"
+
+class HDMIRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/hdmi/on":
+            set_hdmi(True)
+            self._redirect_home()
+        elif self.path == "/hdmi/off":
+            set_hdmi(False)
+            self._redirect_home()
+        elif self.path == "/" or self.path.startswith("/?"):
+            self._serve_dashboard()
+        else:
+            self.send_error(404, "Stránka nenalezena")
+
+    def _redirect_home(self):
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.end_headers()
+
+    def _serve_dashboard(self):
+        status = get_hdmi_status()
+        is_on = status.lower() in ["connected", "on", "enabled"]
+
+        status_text = "ZAPNUTO" if is_on else "VYPNUTO / SPÁNEK"
+        status_color = "#22c55e" if is_on else "#ef4444"
+
+        html = f"""<!DOCTYPE html>
 <html lang="cs">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HDMI Ovladač</title>
+    <title>HDMI Server</title>
     <style>
-        body {
-            font-family: Arial, sans-serif;
-            text-align: center;
-            background-color: #1e1e1e;
-            color: #ffffff;
-            padding-top: 50px;
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: #0f172a;
+            color: #f8fafc;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
             margin: 0;
-        }
-        h1 { color: #f1f1f1; }
-        .btn {
-            display: inline-block;
-            width: 200px;
-            padding: 20px;
-            margin: 15px;
-            font-size: 18px;
-            font-weight: bold;
-            border: none;
+            padding: 16px;
+            box-sizing: border-box;
+        }}
+        .card {{
+            background: #1e293b;
+            padding: 32px;
+            border-radius: 16px;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.4);
+            text-align: center;
+            width: 100%;
+            max-width: 400px;
+        }}
+        h1 {{
+            font-size: 1.5rem;
+            margin-bottom: 24px;
+            color: #94a3b8;
+        }}
+        .status-box {{
+            padding: 12px;
             border-radius: 8px;
-            cursor: pointer;
-            transition: 0.3s;
-            color: white;
+            background: #0f172a;
+            font-weight: bold;
+            font-size: 1.1rem;
+            margin-bottom: 32px;
+            color: {status_color};
+            border: 1px solid {status_color};
+        }}
+        .btn {{
+            display: block;
+            width: 100%;
+            padding: 16px;
+            margin: 12px 0;
+            border: none;
+            border-radius: 10px;
+            font-size: 1.1rem;
+            font-weight: 600;
             text-decoration: none;
-        }
-        .btn-on { background-color: #2ec4b6; }
-        .btn-on:hover { background-color: #20a497; }
-        .btn-off { background-color: #e71d36; }
-        .btn-off:hover { background-color: #b61225; }
+            cursor: pointer;
+            transition: opacity 0.2s;
+            box-sizing: border-box;
+        }}
+        .btn:hover {{ opacity: 0.9; }}
+        .btn-on {{ background-color: #22c55e; color: white; }}
+        .btn-off {{ background-color: #ef4444; color: white; }}
+        .footer {{
+            margin-top: 24px;
+            font-size: 0.8rem;
+            color: #64748b;
+        }}
     </style>
 </head>
 <body>
-    <h1>Ovládání HDMI Výstupu</h1>
-    <p>Vyberte akci pro monitor:</p>
-    <a href="/hdmi/on" class="btn btn-on">ZAPNOUT HDMI</a>
-    <a href="/hdmi/off" class="btn btn-off">VYPNOUT HDMI</a>
+    <div class="card">
+        <h1>HDMI Control Server</h1>
+        <div class="status-box">Stav: {status_text}</div>
+        <a href="/hdmi/on" class="btn btn-on">Zapnout HDMI (ON)</a>
+        <a href="/hdmi/off" class="btn btn-off">Vypnout HDMI (OFF)</a>
+        <div class="footer">Cesta: {HDMI_STATUS_PATH}</div>
+    </div>
 </body>
 </html>
 """
-
-
-class HdmiController:
-    def __init__(self, device_path: str):
-        self.device_path = device_path
-
-    def set_status(self, action: str) -> bool:
-        if action not in ("on", "off"):
-            return False
-
-        logging.info(f"Nastavuji HDMI status -> {action}")
-        try:
-            with open(self.device_path, "w") as f:
-                f.write(f"{action}\n")
-            return True
-        except PermissionError:
-            pass
-        except Exception as e:
-            logging.warning(f"Zápis selhal: {e}")
-
-        cmd = f"echo {action} | sudo tee {self.device_path} > /dev/null"
-        try:
-            subprocess.run(cmd, shell=True, check=True)
-            return True
-        except subprocess.SubprocessError as e:
-            logging.error(f"Příkaz selhal: {e}")
-            return False
-
-
-class HdmiRequestHandler(BaseHTTPRequestHandler):
-    controller: HdmiController = None
-
-    def do_GET(self):
-        path = urlparse(self.path).path
-
-        if path == "/":
-            body = HTML_PAGE.encode("utf-8")
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/html; charset=UTF-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        elif path in ("/hdmi/on", "/hdmi/off"):
-            action = "on" if path == "/hdmi/on" else "off"
-            self.controller.set_status(action)
-            self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-        else:
-            self.send_error(HTTPStatus.NOT_FOUND)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(html.encode("utf-8"))))
+        self.end_headers()
+        self.wfile.write(html.encode("utf-8"))
 
     def log_message(self, format, *args):
-        logging.info("%s - %s", self.address_string(), format % args)
+        # Čisté logování požadavků
+        print(f"[HTTP] {self.address_string()} - {format % args}")
 
+def run_server(port):
+    # ==============================================================
+    # ⚡ AUTOMATICKÉ VYPNUTÍ MONITORU PŘI SPUŠTĚNÍ PROGRAMU ⚡
+    # ==============================================================
+    print("[STARTUP] Automatické vypínání HDMI monitoru při startu...")
+    set_hdmi(False)
 
-def main():
-    parser = argparse.ArgumentParser(description="HDMI Web Controller")
-    parser.add_argument("--port", "-p", type=int, default=DEFAULT_PORT, help="Port serveru")
-    parser.add_argument("--device", "-d", type=str, default=DEFAULT_DEVICE, help="Cesta k DRM souboru")
-    parser.add_argument("--init-off", action="store_true", help="Vypnout HDMI ihned při spuštění")
-    args = parser.parse_args()
-
-    controller = HdmiController(args.device)
-    HdmiRequestHandler.controller = controller
-
-    if args.init_off:
-        controller.set_status("off")
-
-    server = ThreadingHTTPServer(("0.0.0.0", args.port), HdmiRequestHandler)
-    logging.info(f"HDMI server běží na http://0.0.0.0:{args.port}")
+    server_address = ("", port)
+    httpd = HTTPServer(server_address, HDMIRequestHandler)
+    print(f"[SERVER] Běží na http://0.0.0.0:{port} (HDMI cesta: {HDMI_STATUS_PATH})")
     try:
-        server.serve_forever()
+        httpd.serve_forever()
     except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-
+        print("\n[SERVER] Zastavování...")
+        httpd.server_close()
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="HDMI Web Control Server")
+    parser.add_argument("--port", type=int, default=PORT, help=f"Port serveru (výchozí: {PORT})")
+    args = parser.parse_args()
+
+    run_server(args.port)
