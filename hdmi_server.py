@@ -12,10 +12,23 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 PORT = 1111
 
-# --- PROSTŘEDÍ PRO X11 (SNÍMÁNÍ OBRAZOVKY) ---
-def get_x11_env():
+# --- PROSTŘEDÍ PRO WAYLAND I X11 ---
+def get_display_env():
+    """Nastaví prostředí pro běh grafických nástrojů z background služby."""
     env = os.environ.copy()
     env["DISPLAY"] = ":0"
+    
+    # Detekce Wayland socketu a runtime adresáře
+    uid = os.getuid()
+    runtime_dir = f"/run/user/{uid}" if os.path.exists(f"/run/user/{uid}") else "/run/user/1000"
+    env["XDG_RUNTIME_DIR"] = runtime_dir
+    
+    for wl in ["wayland-1", "wayland-0"]:
+        if os.path.exists(os.path.join(runtime_dir, wl)):
+            env["WAYLAND_DISPLAY"] = wl
+            break
+
+    # X11 autorizace
     for path in ["/home/cernytom/.Xauthority", "/home/pi/.Xauthority", os.path.expanduser("~/.Xauthority")]:
         if os.path.exists(path):
             env["XAUTHORITY"] = path
@@ -24,6 +37,7 @@ def get_x11_env():
 
 # --- OVLÁDÁNÍ ZVUKU ---
 def refresh_audio():
+    """Znovu inicializuje a probudí zvukové rozhraní HDMI."""
     print("[AUDIO] Obnovuji zvukové subsystémy...")
     commands = [
         "udevadm trigger --subsystem-match=sound",
@@ -83,7 +97,7 @@ def get_hdmi_status() -> str:
     except Exception:
         return "neznámý"
 
-# --- OVLÁDÁNÍ MYŠI ---
+# --- OVLÁDÁNÍ MYŠI (EVDEV / XDOTOOL) ---
 try:
     import evdev
     from evdev import UInput, ecodes as e
@@ -101,6 +115,7 @@ class MouseController:
                     e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE]
                 }
                 self.ui = UInput(cap, name="RPi-Web-Touchpad")
+                print("[MOUSE] Inicializován uinput/evdev ovladač myši.")
             except Exception:
                 pass
 
@@ -112,7 +127,7 @@ class MouseController:
         else:
             subprocess.run(
                 ["xdotool", "mousemove_relative", "--", str(dx), str(dy)],
-                env=get_x11_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                env=get_display_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
 
     def click(self, button: str = "left"):
@@ -126,12 +141,12 @@ class MouseController:
             btn_num = "1" if button == "left" else "3"
             subprocess.run(
                 ["xdotool", "click", btn_num],
-                env=get_x11_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                env=get_display_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
 
 mouse = MouseController()
 
-# --- SNÍMÁNÍ OBRAZOVKY S VYCENTROVANOU MYŠÍ ---
+# --- SNÍMÁNÍ OBRAZOVKY A CENTROVÁNÍ NA MYŠ ---
 try:
     from PIL import Image
     HAS_PIL = True
@@ -144,11 +159,11 @@ CROP_WIDTH = 500
 CROP_HEIGHT = 400
 
 def get_mouse_position():
-    """Získá aktuální souřadnice myši přes xdotool."""
+    """Získá aktuální pozici myši pomocí xdotool."""
     try:
         res = subprocess.run(
             ["xdotool", "getmouselocation"],
-            env=get_x11_env(), capture_output=True, text=True, timeout=1
+            env=get_display_env(), capture_output=True, text=True, timeout=1
         )
         match = re.search(r"x:(\d+)\s+y:(\d+)", res.stdout)
         if match:
@@ -158,46 +173,59 @@ def get_mouse_position():
     return None, None
 
 def capture_centered_crop():
-    """Pořídí screenshot a ořízne ho tak, aby kurzor byl přesně uprostřed."""
+    """Pořídí snímek (přes grim pro Wayland nebo scrot pro X11) a ořízne na myš."""
     global last_capture_time, cached_image_bytes
 
     now = time.time()
-    # Cache na 250 ms, aby se nepřetížilo RPi3 při vícenásobných požadavcích
+    # Cache 250ms pro optimalizaci výkonu RPi 3
     if cached_image_bytes and (now - last_capture_time < 0.25):
         return cached_image_bytes
 
     if not HAS_PIL:
         return None
 
-    # Ukládání do RAM disku (/dev/shm)
     temp_raw = "/dev/shm/rpi_raw_screen.jpg"
-    
+    env = get_display_env()
+
+    # Smazat starý snímek, aby nezůstal viset
+    if os.path.exists(temp_raw):
+        try:
+            os.remove(temp_raw)
+        except OSError:
+            pass
+
     try:
-        # Pořídit snímek celé obrazovky
+        # 1. Pokus: grim (pro Wayland na Raspberry Pi OS Bookworm)
         ret = subprocess.run(
-            ["scrot", "-z", "-o", "-q", "50", temp_raw],
-            env=get_x11_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2
+            ["grim", "-q", "50", temp_raw],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2
         )
+
+        # 2. Pokus: pokud grim selhal nebo není nainstalován, použijeme scrot (pro X11)
         if ret.returncode != 0 or not os.path.exists(temp_raw):
+            subprocess.run(
+                ["scrot", "-z", "-o", "-q", "50", temp_raw],
+                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2
+            )
+
+        if not os.path.exists(temp_raw):
             return None
 
         mx, my = get_mouse_position()
         img = Image.open(temp_raw)
         img_w, img_h = img.size
 
+        # Pokud xdotool nenašel pozici, vycentrujeme na střed obrazovky
         if mx is None or my is None:
             mx, my = img_w // 2, img_h // 2
 
-        # Vytvořit prázdné plátno o velikosti výřezu
         canvas = Image.new("RGB", (CROP_WIDTH, CROP_HEIGHT), (20, 24, 33))
 
-        # Spočítat ořez tak, aby (mx, my) bylo v (CROP_WIDTH//2, CROP_HEIGHT//2)
         crop_x1 = mx - CROP_WIDTH // 2
         crop_y1 = my - CROP_HEIGHT // 2
         crop_x2 = crop_x1 + CROP_WIDTH
         crop_y2 = crop_y1 + CROP_HEIGHT
 
-        # Průnik s reálnými rozměry obrazovky
         src_x1 = max(0, crop_x1)
         src_y1 = max(0, crop_y1)
         src_x2 = min(img_w, crop_x2)
@@ -216,7 +244,7 @@ def capture_centered_crop():
         return cached_image_bytes
 
     except Exception as ex:
-        print(f"[SCREEN] Chyba při snímání: {ex}")
+        print(f"[SCREEN] Chyba: {ex}")
         return None
 
 # --- HTML ŠABLONA ---
@@ -309,7 +337,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             pointer-events: none;
             opacity: 0.9;
         }
-        /* Zaměřovač vycentrovaný přesně na kurzor */
         .crosshair {
             position: absolute;
             width: 24px;
@@ -409,7 +436,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         let accX = 0, accY = 0;
         let isSending = false;
 
-        // Odesílání pohybu myši
         function flushMove() {
             if ((accX !== 0 || accY !== 0) && !isSending) {
                 const x = accX;
@@ -423,7 +449,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
         setInterval(flushMove, 25);
 
-        // Obnova hledáčku / screenshotu (cca 2 FPS pro plynulost bez přehřívání RPi3)
         function updateScreen() {
             if (!streamEnabled || isFetchingScreen) return;
             isFetchingScreen = true;
@@ -486,8 +511,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             if (dist < 8 && duration < 250) {
                 sendClick('left');
             }
-            // Po dokončení pohybu hned aktualizovat obraz
-            setTimeout(updateScreen, 50);
+            setTimeout(updateScreen, 60);
         }, { passive: false });
 
         function sendClick(btn) {
@@ -600,18 +624,18 @@ class ServerHandler(BaseHTTPRequestHandler):
         self.wfile.write(html.encode("utf-8"))
 
     def log_message(self, format, *args):
-        # Filtrovat časté volání myši a obrazovky z logů
         if len(args) > 0 and any(k in str(args[0]) for k in ["api/mouse", "api/screen"]):
             return
         print(f"[HTTP] {self.address_string()} - {format % args}")
 
 def run_server(port):
+    # Automatické vypnutí displeje při spuštění
     print("[STARTUP] Automatické vypínání HDMI monitoru...")
     set_hdmi(False)
 
     server_address = ("", port)
     httpd = ThreadingHTTPServer(server_address, ServerHandler)
-    print(f"[SERVER] Běží na portu {port} (Touchpad + Centered Screen View)")
+    print(f"[SERVER] Běží na portu {port} (Touchpad + Screen Crop + HDMI)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
