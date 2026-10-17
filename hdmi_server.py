@@ -32,8 +32,6 @@ cur_x = screen_width // 2
 cur_y = screen_height // 2
 pos_lock = threading.Lock()
 
-print(f"[SCREEN] Detekováno rozlišení obrazovky: {screen_width}x{screen_height}")
-
 # --- OVLÁDÁNÍ ZVUKU ---
 def refresh_audio():
     print("[AUDIO] Obnovuji zvuk...")
@@ -136,28 +134,24 @@ class MouseController:
             self.ui.syn()
 
     def recenter(self):
-        """Hardwarová kalibrace: hodí myš do rohu 0,0 a pak přesně na střed."""
         global cur_x, cur_y
         with pos_lock:
             cur_x = screen_width // 2
             cur_y = screen_height // 2
 
         if self.ui:
-            # Zajet do levého horního rohu (-3000, -3000)
-            for _ in range(3):
+            for _ in range(4):
                 self.ui.write(e.EV_REL, e.REL_X, -1000)
                 self.ui.write(e.EV_REL, e.REL_Y, -1000)
                 self.ui.syn()
-                time.sleep(0.01)
-            # Skočit na střed obrazovky
+                time.sleep(0.005)
             self.ui.write(e.EV_REL, e.REL_X, screen_width // 2)
             self.ui.write(e.EV_REL, e.REL_Y, screen_height // 2)
             self.ui.syn()
-        print(f"[MOUSE] Kalibrace: Myš vycentrována na ({cur_x}, {cur_y})")
 
 mouse = MouseController()
 
-# --- SNÍMÁNÍ OBRAZOVKY S PŘESNÝM POMĚREM STRAN ---
+# --- SNÍMÁNÍ OBRAZOVKY S PŘIROZENÝM POMĚREM STRAN ---
 last_capture_time = 0
 cached_image_bytes = None
 
@@ -170,9 +164,9 @@ def capture_centered_crop(req_w, req_h):
 
     temp_raw = "/dev/shm/rpi_crop.png"
 
-    # Omezíme rozměry na rozumné maximum pro výkon RPi 3
-    crop_w = max(320, min(560, req_w))
-    crop_h = max(240, min(480, req_h))
+    # Zachováme přesný poměr stran podle obrazovky mobilu
+    crop_w = max(240, min(screen_width, req_w))
+    crop_h = max(240, min(screen_height, req_h))
 
     with pos_lock:
         mx, my = cur_x, cur_y
@@ -181,7 +175,6 @@ def capture_centered_crop(req_w, req_h):
     gy = max(0, min(screen_height - crop_h, my - crop_h // 2))
     geom = f"{gx},{gy} {crop_w}x{crop_h}"
 
-    # PARAMETR -c ZAJISTÍ VYFOCENÍ SKUTEČNÉ ŠIPKY MYŠI
     if os.getuid() == 0:
         cmd = [
             "runuser", "-u", USER, "--",
@@ -201,7 +194,7 @@ def capture_centered_crop(req_w, req_h):
 
         img = Image.open(temp_raw)
         buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="JPEG", quality=50, optimize=False)
+        img.convert("RGB").save(buf, format="JPEG", quality=55, optimize=False)
         cached_image_bytes = buf.getvalue()
         last_capture_time = now
         return cached_image_bytes
@@ -278,12 +271,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         #touchpad {
             flex: 1;
             position: relative;
-            background-color: #1e293b;
+            background-color: #000;
             border-radius: 16px;
             border: 2px solid #475569;
             overflow: hidden;
             touch-action: none;
-            cursor: crosshair;
+            cursor: default;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -294,38 +287,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         #screen-view {
             width: 100%;
             height: 100%;
-            object-fit: fill; /* Přesné vyplnění bez ořezu */
+            object-fit: cover; /* Přirozený poměr stran bez natahování */
             position: absolute;
             top: 0;
             left: 0;
             pointer-events: none;
-        }
-        .crosshair {
-            position: absolute;
-            width: 20px;
-            height: 20px;
-            pointer-events: none;
-            z-index: 10;
-        }
-        .crosshair::before {
-            content: '';
-            position: absolute;
-            top: 9px;
-            left: 0;
-            width: 20px;
-            height: 2px;
-            background: #ef4444;
-            box-shadow: 0 0 3px #000;
-        }
-        .crosshair::after {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 9px;
-            width: 2px;
-            height: 20px;
-            background: #ef4444;
-            box-shadow: 0 0 3px #000;
         }
         .mouse-buttons {
             display: flex;
@@ -366,8 +332,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
 
     <div id="touchpad">
-        <img id="screen-view" src="/api/screen/crop?w=480&h=360" alt="">
-        <div class="crosshair"></div>
+        <img id="screen-view" src="/api/screen/crop?w=360&h=480" alt="">
     </div>
 
     <div class="mouse-buttons">
@@ -383,7 +348,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         let streamEnabled = true;
         let isFetchingScreen = false;
         let fetchWatchdog = null;
-        const SENSITIVITY = 1.6;
+        const SENSITIVITY = 1.4;
 
         let lastX = 0, lastY = 0;
         let startX = 0, startY = 0;
@@ -405,7 +370,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
         setInterval(flushMove, 25);
 
-        // Zjištění přesných rozměrů touchpadu pro 1:1 zobrazení
         function updateScreen() {
             if (!streamEnabled || isFetchingScreen) return;
             isFetchingScreen = true;
@@ -413,8 +377,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             clearTimeout(fetchWatchdog);
             fetchWatchdog = setTimeout(() => { isFetchingScreen = false; }, 800);
 
-            const w = Math.round(pad.clientWidth) || 480;
-            const h = Math.round(pad.clientHeight) || 360;
+            // Zjištění reálného rozměru plochy v mobilu pro zachování poměru stran
+            const w = Math.round(pad.clientWidth) || 360;
+            const h = Math.round(pad.clientHeight) || 480;
 
             const nextImg = new Image();
             nextImg.onload = () => {
@@ -544,10 +509,10 @@ class ServerHandler(BaseHTTPRequestHandler):
         elif path == "/api/screen/crop":
             params = parse_qs(parsed.query)
             try:
-                w = int(params.get("w", [480])[0])
-                h = int(params.get("h", [360])[0])
+                w = int(params.get("w", [360])[0])
+                h = int(params.get("h", [480])[0])
             except Exception:
-                w, h = 480, 360
+                w, h = 360, 480
 
             data = capture_centered_crop(w, h)
             if data:
@@ -636,7 +601,7 @@ def run_server(port):
 
     server_address = ("", port)
     httpd = ThreadingHTTPServer(server_address, ServerHandler)
-    print(f"[SERVER] Běží na portu {port} (1:1 hledáček s reálným kurzorem)")
+    print(f"[SERVER] Běží na portu {port} (Nedeformovaný 1:1 náhled)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
