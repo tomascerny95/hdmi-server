@@ -2,6 +2,7 @@
 import os
 import io
 import time
+import json
 import argparse
 import threading
 import subprocess
@@ -39,29 +40,28 @@ cur_x = screen_width // 2
 cur_y = screen_height // 2
 pos_lock = threading.Lock()
 
-# --- OVLÁDÁNÍ ZVUKU ---
+# --- ŠETRNÉ OVLÁDÁNÍ ZVUKU (BEZ PÁDU VLC) ---
 def refresh_audio():
-    commands = [
-        "udevadm trigger --subsystem-match=sound",
-        "alsactl init",
-        "alsactl restore",
-        f"runuser -u {USER} -- pkill -x wireplumber",
-        f"runuser -u {USER} -- pkill -x pipewire",
-        f"runuser -u {USER} -- pulseaudio -k"
-    ]
-    for cmd in commands:
-        try:
-            subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
-    try:
-        cmd_sink = f"runuser -u {USER} -- env XDG_RUNTIME_DIR={RUNTIME_DIR} pactl list sinks short | grep -i hdmi | head -n 1 | awk '{{print $2}}'"
-        res = subprocess.run(cmd_sink, shell=True, capture_output=True, text=True)
-        hdmi_sink = res.stdout.strip()
-        if hdmi_sink:
-            subprocess.run(f"runuser -u {USER} -- env XDG_RUNTIME_DIR={RUNTIME_DIR} pactl set-default-sink {hdmi_sink}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
+    print("[AUDIO] Šetrné probuzení zvuku a přesměrování běžících programů...")
+    subprocess.run("udevadm trigger --subsystem-match=sound", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    cmd_find = f"runuser -u {USER} -- env XDG_RUNTIME_DIR={RUNTIME_DIR} pactl list sinks short | grep -i hdmi | head -n 1 | awk '{{print $2}}'"
+    res = subprocess.run(cmd_find, shell=True, capture_output=True, text=True)
+    hdmi_sink = res.stdout.strip()
+
+    if hdmi_sink:
+        # Nastavení výchozího výstupu a hlasitosti
+        subprocess.run(f"runuser -u {USER} -- env XDG_RUNTIME_DIR={RUNTIME_DIR} pactl set-default-sink {hdmi_sink}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(f"runuser -u {USER} -- env XDG_RUNTIME_DIR={RUNTIME_DIR} pactl set-sink-mute {hdmi_sink} 0", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(f"runuser -u {USER} -- env XDG_RUNTIME_DIR={RUNTIME_DIR} pactl set-sink-volume {hdmi_sink} 100%", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Přesun hrajících aplikací (např. VLC) přímo na HDMI
+        cmd_inputs = f"runuser -u {USER} -- env XDG_RUNTIME_DIR={RUNTIME_DIR} pactl list sink-inputs short | awk '{{print $1}}'"
+        inputs_res = subprocess.run(cmd_inputs, shell=True, capture_output=True, text=True)
+        for stream_id in inputs_res.stdout.split():
+            if stream_id.isdigit():
+                subprocess.run(f"runuser -u {USER} -- env XDG_RUNTIME_DIR={RUNTIME_DIR} pactl move-sink-input {stream_id} {hdmi_sink}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"[AUDIO] Zvuk byl přesměrován na HDMI ({hdmi_sink}).")
 
 def delayed_audio_refresh():
     time.sleep(1.5)
@@ -129,7 +129,7 @@ if HAS_EVDEV:
             CHAR_KEY_MAP[ch.upper()] = (key_code, True)
             VALID_KEY_CODES.append(key_code)
 
-    # ⚡ FIX PRO ČESKÉ QWERTZ ROZLOŽENÍ: PROHOZENÍ Y a Z
+    # Ošetření pro české rozložení QWERTZ
     CHAR_KEY_MAP['y'] = (e.KEY_Z, False)
     CHAR_KEY_MAP['Y'] = (e.KEY_Z, True)
     CHAR_KEY_MAP['z'] = (e.KEY_Y, False)
@@ -219,7 +219,7 @@ class AbsoluteInputController:
             self.ui.syn()
 
     def type_text(self, text: str):
-        # 1. PŘEDNOSTNĚ: wtype (perfektní pro Wayland, podporuje háčky, čárky a neničí Y/Z)
+        # 1. Volba: wtype (přímá podpora Unicode v Waylandu)
         cmd = [
             "runuser", "-u", USER, "--",
             "env", f"XDG_RUNTIME_DIR={RUNTIME_DIR}", "WAYLAND_DISPLAY=wayland-0",
@@ -233,7 +233,7 @@ class AbsoluteInputController:
         except Exception:
             pass
 
-        # 2. ZÁLOŽNĚ: evdev s opraveným QWERTZ mapováním
+        # 2. Volba: evdev záloha
         if not self.ui:
             return
         for char in text:
@@ -568,7 +568,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             setTimeout(updateScreen, 40);
         }, { passive: false });
 
-        // Myš (PC)
+        // PC myš
         pad.addEventListener("mousedown", (e) => {
             isMouseDown = true;
             pad.classList.add("active");
@@ -687,7 +687,6 @@ class ServerHandler(BaseHTTPRequestHandler):
             try:
                 length = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(length).decode("utf-8")
-                import json
                 data = json.loads(body)
                 text = data.get("text", "")
                 if text:
@@ -738,7 +737,7 @@ def run_server(port):
 
     server_address = ("", port)
     httpd = ThreadingHTTPServer(server_address, ServerHandler)
-    print(f"[SERVER] Běží na portu {port} (Absolutní myš + Podpora wtype)")
+    print(f"[SERVER] Běží na portu {port} (Absolutní myš + Šetrný zvuk + Klávesnice)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
