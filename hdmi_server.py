@@ -14,12 +14,16 @@ PORT = 1111
 USER = "cernytom"
 RUNTIME_DIR = "/run/user/1000"
 
-# --- INTERNÍ SLEDOVÁNÍ POZICE MYŠI ---
+# --- SLEDOVÁNÍ POZICE MYŠI ---
 screen_width = 1920
 screen_height = 1080
 cur_x = screen_width // 2
 cur_y = screen_height // 2
 pos_lock = threading.Lock()
+
+# Rozměry hledáčku
+CROP_WIDTH = 480
+CROP_HEIGHT = 360
 
 # --- OVLÁDÁNÍ ZVUKU ---
 def refresh_audio():
@@ -67,12 +71,12 @@ def set_hdmi(enable: bool) -> bool:
     try:
         with open(HDMI_STATUS_PATH, "w") as f:
             f.write(state_str + "\n")
-        print(f"[HDMI] Monitor přepnut do: {state_str.upper()}")
+        print(f"[HDMI] Monitor: {state_str.upper()}")
         if enable:
             threading.Thread(target=delayed_audio_refresh, daemon=True).start()
         return True
     except Exception as e:
-        print(f"[CHYBA] Zápis do {HDMI_STATUS_PATH} selhal: {e}")
+        print(f"[CHYBA] HDMI: {e}")
         return False
 
 def get_hdmi_status() -> str:
@@ -100,9 +104,8 @@ class MouseController:
                     e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE]
                 }
                 self.ui = UInput(cap, name="RPi-Web-Touchpad")
-                print("[MOUSE] Úspěšně vytvořen uinput ovladač myši.")
-            except Exception as ex:
-                print(f"[MOUSE] evdev selhal: {ex}")
+            except Exception:
+                pass
 
     def move(self, dx: int, dy: int):
         global cur_x, cur_y
@@ -125,79 +128,55 @@ class MouseController:
 
 mouse = MouseController()
 
-# --- SNÍMÁNÍ OBRAZOVKY (GRIM JAKO PNG DO RAM DISKU) ---
+# --- ULTRA RYCHLÉ SNÍMÁNÍ VÝŘEZU (GRIM -G) ---
 last_capture_time = 0
 cached_image_bytes = None
-CROP_WIDTH = 500
-CROP_HEIGHT = 400
 
 def capture_centered_crop():
-    global last_capture_time, cached_image_bytes, screen_width, screen_height
+    global last_capture_time, cached_image_bytes
 
     now = time.time()
-    if cached_image_bytes and (now - last_capture_time < 0.20):
+    # Povolit až cca 15 FPS
+    if cached_image_bytes and (now - last_capture_time < 0.06):
         return cached_image_bytes
 
-    # Ukládáme nativně do PNG (grim v Debianu neumí přímo JPEG)
-    temp_raw = "/dev/shm/rpi_raw_screen.png"
+    temp_raw = "/dev/shm/rpi_crop.png"
 
-    if os.path.exists(temp_raw):
-        try:
-            os.remove(temp_raw)
-        except OSError:
-            pass
+    with pos_lock:
+        mx, my = cur_x, cur_y
 
+    # Spočítat ořez a omezit na okraje obrazovky
+    gx = max(0, min(screen_width - CROP_WIDTH, mx - CROP_WIDTH // 2))
+    gy = max(0, min(screen_height - CROP_HEIGHT, my - CROP_HEIGHT // 2))
+    geom = f"{gx},{gy} {CROP_WIDTH}x{CROP_HEIGHT}"
+
+    # grim fotí POUZE daný výřez 480x360 - extrémně rychlé!
     if os.getuid() == 0:
         cmd = [
             "runuser", "-u", USER, "--",
             "env", f"XDG_RUNTIME_DIR={RUNTIME_DIR}", "WAYLAND_DISPLAY=wayland-0",
-            "grim", temp_raw
+            "grim", "-g", geom, temp_raw
         ]
     else:
         env = os.environ.copy()
         env["XDG_RUNTIME_DIR"] = RUNTIME_DIR
         env["WAYLAND_DISPLAY"] = "wayland-0"
-        cmd = ["grim", temp_raw]
+        cmd = ["grim", "-g", geom, temp_raw]
 
     try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1)
         if not os.path.exists(temp_raw):
-            return None
+            return cached_image_bytes
 
         img = Image.open(temp_raw)
-        screen_width, screen_height = img.size
-
-        with pos_lock:
-            mx, my = cur_x, cur_y
-
-        canvas = Image.new("RGB", (CROP_WIDTH, CROP_HEIGHT), (20, 24, 33))
-
-        crop_x1 = mx - CROP_WIDTH // 2
-        crop_y1 = my - CROP_HEIGHT // 2
-        crop_x2 = crop_x1 + CROP_WIDTH
-        crop_y2 = crop_y1 + CROP_HEIGHT
-
-        src_x1 = max(0, crop_x1)
-        src_y1 = max(0, crop_y1)
-        src_x2 = min(screen_width, crop_x2)
-        src_y2 = min(screen_height, crop_y2)
-
-        if src_x2 > src_x1 and src_y2 > src_y1:
-            cropped = img.crop((src_x1, src_y1, src_x2, src_y2))
-            paste_x = src_x1 - crop_x1
-            paste_y = src_y1 - crop_y1
-            canvas.paste(cropped, (paste_x, paste_y))
-
-        # Pillow oříznutý snímek převede a zkomprimuje do JPEG pro telefon
         buf = io.BytesIO()
-        canvas.save(buf, format="JPEG", quality=55, optimize=True)
+        img.convert("RGB").save(buf, format="JPEG", quality=50, optimize=False)
         cached_image_bytes = buf.getvalue()
         last_capture_time = now
         return cached_image_bytes
 
-    except Exception as ex:
-        print(f"[SCREEN] Chyba: {ex}")
-        return None
+    except Exception:
+        return cached_image_bytes
 
 # --- HTML ŠABLONA ---
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -205,7 +184,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>RPi Remote Touchpad</title>
+    <title>RPi Remote Control</title>
     <style>
         * {
             box-sizing: border-box;
@@ -272,6 +251,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             border: 2px solid #475569;
             overflow: hidden;
             touch-action: none;
+            cursor: crosshair;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -364,7 +344,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div id="touchpad">
         <img id="screen-view" src="/api/screen/crop" alt="">
         <div class="crosshair"></div>
-        <div class="touchpad-hint">Křížek = pozice myši</div>
+        <div class="touchpad-hint">Křížek = myš</div>
     </div>
 
     <div class="mouse-buttons">
@@ -379,6 +359,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         let streamEnabled = true;
         let isFetchingScreen = false;
+        let fetchWatchdog = null;
         const SENSITIVITY = 1.6;
 
         let lastX = 0, lastY = 0;
@@ -386,7 +367,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         let startTime = 0;
         let accX = 0, accY = 0;
         let isSending = false;
+        let isMouseDown = false;
 
+        // Odesílání pohybu (40x za sekundu)
         function flushMove() {
             if ((accX !== 0 || accY !== 0) && !isSending) {
                 const x = accX;
@@ -400,9 +383,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
         setInterval(flushMove, 25);
 
+        // Zrychlená obnova hledáčku (~8 FPS) s watchdogem proti zaseknutí
         function updateScreen() {
             if (!streamEnabled || isFetchingScreen) return;
             isFetchingScreen = true;
+
+            clearTimeout(fetchWatchdog);
+            fetchWatchdog = setTimeout(() => { isFetchingScreen = false; }, 800);
 
             const nextImg = new Image();
             nextImg.onload = () => {
@@ -414,7 +401,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             };
             nextImg.src = '/api/screen/crop?t=' + Date.now();
         }
-        setInterval(updateScreen, 400);
+        setInterval(updateScreen, 120);
 
         function toggleStream() {
             streamEnabled = !streamEnabled;
@@ -429,6 +416,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
+        // --- DOTYK (MOBIL) ---
         pad.addEventListener("touchstart", (e) => {
             e.preventDefault();
             pad.classList.add("active");
@@ -443,12 +431,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         pad.addEventListener("touchmove", (e) => {
             e.preventDefault();
             const t = e.touches[0];
-            const dx = (t.clientX - lastX) * SENSITIVITY;
-            const dy = (t.clientY - lastY) * SENSITIVITY;
-            
-            accX += Math.round(dx);
-            accY += Math.round(dy);
-
+            accX += Math.round((t.clientX - lastX) * SENSITIVITY);
+            accY += Math.round((t.clientY - lastY) * SENSITIVITY);
             lastX = t.clientX;
             lastY = t.clientY;
         }, { passive: false });
@@ -457,17 +441,45 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             e.preventDefault();
             pad.classList.remove("active");
             const dist = Math.hypot(lastX - startX, lastY - startY);
-            const duration = Date.now() - startTime;
-
-            if (dist < 8 && duration < 250) {
+            if (dist < 8 && (Date.now() - startTime) < 250) {
                 sendClick('left');
             }
-            setTimeout(updateScreen, 50);
+            setTimeout(updateScreen, 40);
         }, { passive: false });
+
+        // --- MYŠ (PC S WINDOWS) ---
+        pad.addEventListener("mousedown", (e) => {
+            isMouseDown = true;
+            pad.classList.add("active");
+            lastX = e.clientX;
+            lastY = e.clientY;
+            startX = e.clientX;
+            startY = e.clientY;
+            startTime = Date.now();
+        });
+
+        window.addEventListener("mousemove", (e) => {
+            if (!isMouseDown) return;
+            accX += Math.round((e.clientX - lastX) * SENSITIVITY);
+            accY += Math.round((e.clientY - lastY) * SENSITIVITY);
+            lastX = e.clientX;
+            lastY = e.clientY;
+        });
+
+        window.addEventListener("mouseup", (e) => {
+            if (!isMouseDown) return;
+            isMouseDown = false;
+            pad.classList.remove("active");
+            const dist = Math.hypot(lastX - startX, lastY - startY);
+            if (dist < 8 && (Date.now() - startTime) < 250) {
+                sendClick('left');
+            }
+            setTimeout(updateScreen, 40);
+        });
 
         function sendClick(btn) {
             fetch('/api/mouse/click?btn=' + btn, { method: 'POST' });
-            setTimeout(updateScreen, 150);
+            setTimeout(updateScreen, 80);
         }
 
         function triggerAudioRefresh() {
@@ -511,7 +523,7 @@ class ServerHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(data)
             else:
-                self.send_error(503, "Snímek není k dispozici")
+                self.send_error(503)
         elif path == "/hdmi/on":
             set_hdmi(True)
             self._redirect_home()
@@ -585,7 +597,7 @@ def run_server(port):
 
     server_address = ("", port)
     httpd = ThreadingHTTPServer(server_address, ServerHandler)
-    print(f"[SERVER] Běží na portu {port} (Labwc Touchpad + PNG to RAM)")
+    print(f"[SERVER] Běží na portu {port} (Zrychlený hledáček grim -g)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
