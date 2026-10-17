@@ -125,7 +125,7 @@ class MouseController:
 
 mouse = MouseController()
 
-# --- SNÍMÁNÍ OBRAZOVKY (GRIM NA WAYLAND-0) ---
+# --- SNÍMÁNÍ OBRAZOVKY (GRIM JAKO PNG DO RAM DISKU) ---
 last_capture_time = 0
 cached_image_bytes = None
 CROP_WIDTH = 500
@@ -138,8 +138,8 @@ def capture_centered_crop():
     if cached_image_bytes and (now - last_capture_time < 0.20):
         return cached_image_bytes
 
-    # Použijeme striktně příponu .jpeg a parametr -t jpeg pro grim
-    temp_raw = "/dev/shm/rpi_raw_screen.jpeg"
+    # Ukládáme nativně do PNG (grim v Debianu neumí přímo JPEG)
+    temp_raw = "/dev/shm/rpi_raw_screen.png"
 
     if os.path.exists(temp_raw):
         try:
@@ -151,13 +151,13 @@ def capture_centered_crop():
         cmd = [
             "runuser", "-u", USER, "--",
             "env", f"XDG_RUNTIME_DIR={RUNTIME_DIR}", "WAYLAND_DISPLAY=wayland-0",
-            "grim", "-t", "jpeg", "-q", "50", temp_raw
+            "grim", temp_raw
         ]
     else:
         env = os.environ.copy()
         env["XDG_RUNTIME_DIR"] = RUNTIME_DIR
         env["WAYLAND_DISPLAY"] = "wayland-0"
-        cmd = ["grim", "-t", "jpeg", "-q", "50", temp_raw]
+        cmd = ["grim", temp_raw]
 
     try:
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
@@ -188,6 +188,7 @@ def capture_centered_crop():
             paste_y = src_y1 - crop_y1
             canvas.paste(cropped, (paste_x, paste_y))
 
+        # Pillow oříznutý snímek převede a zkomprimuje do JPEG pro telefon
         buf = io.BytesIO()
         canvas.save(buf, format="JPEG", quality=55, optimize=True)
         cached_image_bytes = buf.getvalue()
@@ -584,7 +585,7 @@ def run_server(port):
 
     server_address = ("", port)
     httpd = ThreadingHTTPServer(server_address, ServerHandler)
-    print(f"[SERVER] Běží na portu {port} (Labwc/Wayland Touchpad + Centered Screen)")
+    print(f"[SERVER] Běží na portu {port} (Labwc Touchpad + PNG to RAM)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
