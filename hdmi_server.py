@@ -56,7 +56,7 @@ class MouseController:
                 self.ui = UInput(cap, name="RPi-Web-Touchpad")
                 print("[MOUSE] Úspěšně inicializován uinput/evdev ovladač myši.")
             except Exception as ex:
-                print(f"[MOUSE] evdev inicializace selhala ({ex}), přepínám na xdotool fallback.")
+                print(f"[MOUSE] evdev inicializace selhala ({ex}), přepínám na xdotool.")
 
     def move(self, dx: int, dy: int):
         if self.ui:
@@ -86,6 +86,203 @@ class MouseController:
             )
 
 mouse = MouseController()
+
+# --- HTML ŠABLONA ---
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="cs">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>RPi Remote Control</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: #0f172a;
+            color: #f8fafc;
+            margin: 0;
+            padding: 12px;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+            gap: 8px;
+        }
+        .status-badge {
+            padding: 8px 12px;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            font-weight: bold;
+            color: __STATUS_COLOR__;
+            border: 1px solid __STATUS_COLOR__;
+            white-space: nowrap;
+        }
+        .hdmi-buttons {
+            display: flex;
+            gap: 8px;
+            flex-grow: 1;
+            justify-content: flex-end;
+        }
+        .btn-hdmi {
+            padding: 8px 14px;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            font-weight: bold;
+            border: none;
+            cursor: pointer;
+            color: white;
+            text-decoration: none;
+        }
+        .btn-on { background-color: #16a34a; }
+        .btn-off { background-color: #dc2626; }
+
+        #touchpad {
+            flex: 1;
+            background-color: #1e293b;
+            border-radius: 16px;
+            border: 2px dashed #475569;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-direction: column;
+            color: #94a3b8;
+            touch-action: none;
+            box-shadow: inset 0 2px 8px rgba(0,0,0,0.4);
+        }
+        #touchpad.active {
+            border-color: #38bdf8;
+            background-color: #1a2537;
+        }
+        .touchpad-label {
+            font-size: 1.1rem;
+            font-weight: 500;
+            pointer-events: none;
+        }
+        .touchpad-hint {
+            font-size: 0.8rem;
+            color: #64748b;
+            margin-top: 6px;
+            pointer-events: none;
+        }
+        .mouse-buttons {
+            display: flex;
+            gap: 12px;
+            margin-top: 12px;
+            height: 65px;
+        }
+        .btn-mouse {
+            flex: 1;
+            background: #334155;
+            color: white;
+            border: none;
+            border-radius: 12px;
+            font-size: 1rem;
+            font-weight: 600;
+            touch-action: manipulation;
+            cursor: pointer;
+        }
+        .btn-mouse:active {
+            background: #64748b;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="status-badge">HDMI: __STATUS_TEXT__</div>
+        <div class="hdmi-buttons">
+            <a href="/hdmi/on" class="btn-hdmi btn-on">Zapnout</a>
+            <a href="/hdmi/off" class="btn-hdmi btn-off">Vypnout</a>
+        </div>
+    </div>
+
+    <div id="touchpad">
+        <div class="touchpad-label">🖱️ Dotyková plocha</div>
+        <div class="touchpad-hint">Tažením hýbete myší • Klepnutí = Klik</div>
+    </div>
+
+    <div class="mouse-buttons">
+        <button class="btn-mouse" id="btn-left">Levé tl.</button>
+        <button class="btn-mouse" id="btn-right">Pravé tl.</button>
+    </div>
+
+    <script>
+        const pad = document.getElementById("touchpad");
+        const SENSITIVITY = 1.6;
+
+        let lastX = 0, lastY = 0;
+        let startX = 0, startY = 0;
+        let startTime = 0;
+        let accX = 0, accY = 0;
+        let isSending = false;
+
+        function flushMove() {
+            if ((accX !== 0 || accY !== 0) && !isSending) {
+                const x = accX;
+                const y = accY;
+                accX = 0;
+                accY = 0;
+                isSending = true;
+                fetch('/api/mouse/move?dx=' + x + '&dy=' + y, { method: 'POST' })
+                    .finally(() => { isSending = false; });
+            }
+        }
+        setInterval(flushMove, 25);
+
+        pad.addEventListener("touchstart", (e) => {
+            e.preventDefault();
+            pad.classList.add("active");
+            const t = e.touches[0];
+            lastX = t.clientX;
+            lastY = t.clientY;
+            startX = t.clientX;
+            startY = t.clientY;
+            startTime = Date.now();
+        }, { passive: false });
+
+        pad.addEventListener("touchmove", (e) => {
+            e.preventDefault();
+            const t = e.touches[0];
+            const dx = (t.clientX - lastX) * SENSITIVITY;
+            const dy = (t.clientY - lastY) * SENSITIVITY;
+            
+            accX += Math.round(dx);
+            accY += Math.round(dy);
+
+            lastX = t.clientX;
+            lastY = t.clientY;
+        }, { passive: false });
+
+        pad.addEventListener("touchend", (e) => {
+            e.preventDefault();
+            pad.classList.remove("active");
+            const dist = Math.hypot(lastX - startX, lastY - startY);
+            const duration = Date.now() - startTime;
+
+            if (dist < 8 && duration < 250) {
+                sendClick('left');
+            }
+        }, { passive: false });
+
+        function sendClick(btn) {
+            fetch('/api/mouse/click?btn=' + btn, { method: 'POST' });
+        }
+
+        document.getElementById("btn-left").addEventListener("click", () => sendClick('left'));
+        document.getElementById("btn-right").addEventListener("click", () => sendClick('right'));
+    </script>
+</body>
+</html>
+"""
 
 # --- HTTP HANDLER ---
 class ServerHandler(BaseHTTPRequestHandler):
@@ -150,203 +347,8 @@ class ServerHandler(BaseHTTPRequestHandler):
         status_text = "ZAPNUTO" if is_on else "VYPNUTO"
         status_color = "#22c55e" if is_on else "#ef4444"
 
-        html = f"""<!DOCTYPE html>
-<html lang="cs">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>RPi Remote Control</title>
-    <style>
-        * {{
-            box-sizing: border-box;
-            user-select: none;
-            -webkit-user-select: none;
-        }}
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background-color: #0f172a;
-            color: #f8fafc;
-            margin: 0;
-            padding: 12px;
-            height: 100vh;
-            display: flex;
-            flex-direction: column;
-            overflow: hidden;
-        }}
-        .header {{
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 12px;
-            gap: 8px;
-        }}
-        .status-badge {{
-            padding: 8px 12px;
-            border-radius: 8px;
-            font-size: 0.85rem;
-            font-weight: bold;
-            color: {status_color};
-            border: 1px solid {status_color};
-            white-space: nowrap;
-        }}
-        .hdmi-buttons {{
-            display: flex;
-            gap: 8px;
-            flex-grow: 1;
-            justify-content: flex-end;
-        }}
-        .btn-hdmi {{
-            padding: 8px 14px;
-            border-radius: 8px;
-            font-size: 0.85rem;
-            font-weight: bold;
-            border: none;
-            cursor: pointer;
-            color: white;
-            text-decoration: none;
-        }}
-        .btn-on {{ background-color: #16a34a; }}
-        .btn-off {{ background-color: #dc2626; }}
+        html = HTML_TEMPLATE.replace("__STATUS_TEXT__", status_text).replace("__STATUS_COLOR__", status_color)
 
-        #touchpad {{
-            flex: 1;
-            background-color: #1e293b;
-            border-radius: 16px;
-            border: 2px dashed #475569;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            flex-direction: column;
-            color: #94a3b8;
-            touch-action: none;
-            box-shadow: inset 0 2px 8px rgba(0,0,0,0.4);
-        }}
-        #touchpad.active {{
-            border-color: #38bdf8;
-            background-color: #1a2537;
-        }}
-        .touchpad-label {{
-            font-size: 1.1rem;
-            font-weight: 500;
-            pointer-events: none;
-        }}
-        .touchpad-hint {{
-            font-size: 0.8rem;
-            color: #64748b;
-            margin-top: 6px;
-            pointer-events: none;
-        }}
-        .mouse-buttons {{
-            display: flex;
-            gap: 12px;
-            margin-top: 12px;
-            height: 65px;
-        }}
-        .btn-mouse {{
-            flex: 1;
-            background: #334155;
-            color: white;
-            border: none;
-            border-radius: 12px;
-            font-size: 1rem;
-            font-weight: 600;
-            touch-action: manipulation;
-            cursor: pointer;
-        }}
-        .btn-mouse:active {{
-            background: #64748b;
-        }}
-    </style>
-</head>
-<body>
-    <div class="header">
-        <div class="status-badge">HDMI: {status_text}</div>
-        <div class="hdmi-buttons">
-            <a href="/hdmi/on" class="btn-hdmi btn-on">Zapnout</a>
-            <a href="/hdmi/off" class="btn-hdmi btn-off">Vypnout</a>
-        </div>
-    </div>
-
-    <div id="touchpad">
-        <div class="touchpad-label">🖱️ Dotyková plocha</div>
-        <div class="touchpad-hint">Tažením hýbete myší • Klepnutí = Levý klik</div>
-    </div>
-
-    <div class="mouse-buttons">
-        <button class="btn-mouse" id="btn-left">Levé tl.</button>
-        <button class="btn-mouse" id="btn-right">Pravé tl.</button>
-    </div>
-
-    <script>
-        const pad = document.getElementById("touchpad");
-        const SENSITIVITY = 1.6; // Citlivost myši
-
-        let lastX = 0, lastY = 0;
-        let startX = 0, startY = 0;
-        let startTime = 0;
-        let accX = 0, accY = 0;
-        let isSending = false;
-
-        // Odesílání pohybu plynule ve smyčce (cca 40 FPS)
-        function flushMove() {
-            if ((accX !== 0 || accY !== 0) && !isSending) {
-                const x = accX;
-                const y = accY;
-                accX = 0;
-                accY = 0;
-                isSending = true;
-                fetch(`/api/mouse/move?dx=${{x}}&dy=${{y}}`, {{ method: 'POST' }})
-                    .finally(() => {{ isSending = false; }});
-            }
-        }
-        setInterval(flushMove, 25);
-
-        pad.addEventListener("touchstart", (e) => {{
-            e.preventDefault();
-            pad.classList.add("active");
-            const t = e.touches[0];
-            lastX = t.clientX;
-            lastY = t.clientY;
-            startX = t.clientX;
-            startY = t.clientY;
-            startTime = Date.now();
-        }}, {{ passive: false }});
-
-        pad.addEventListener("touchmove", (e) => {{
-            e.preventDefault();
-            const t = e.touches[0];
-            const dx = (t.clientX - lastX) * SENSITIVITY;
-            const dy = (t.clientY - lastY) * SENSITIVITY;
-            
-            accX += Math.round(dx);
-            accY += Math.round(dy);
-
-            lastX = t.clientX;
-            lastY = t.clientY;
-        }}, {{ passive: false }});
-
-        pad.addEventListener("touchend", (e) => {{
-            e.preventDefault();
-            pad.classList.remove("active");
-            const dist = Math.hypot(lastX - startX, lastY - startY);
-            const duration = Date.now() - startTime;
-
-            // Rychlé klepnutí na ploše bez posunu provede klik
-            if (dist < 8 && duration < 250) {{
-                sendClick('left');
-            }}
-        }}, {{ passive: false }});
-
-        function sendClick(btn) {{
-            fetch(`/api/mouse/click?btn=${{btn}}`, {{ method: 'POST' }});
-        }}
-
-        document.getElementById("btn-left").addEventListener("click", () => sendClick('left'));
-        document.getElementById("btn-right").addEventListener("click", () => sendClick('right'));
-    </script>
-</body>
-</html>
-"""
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(html.encode("utf-8"))))
@@ -354,9 +356,9 @@ class ServerHandler(BaseHTTPRequestHandler):
         self.wfile.write(html.encode("utf-8"))
 
     def log_message(self, format, *args):
-        # Filtrovat logy myši, aby nezaplavovaly konzoli/journalctl
-        if "api/mouse" not in args[0]:
-            print(f"[HTTP] {self.address_string()} - {format % args}")
+        if len(args) > 0 and "api/mouse" in str(args[0]):
+            return
+        print(f"[HTTP] {self.address_string()} - {format % args}")
 
 def run_server(port):
     print("[STARTUP] Automatické vypínání HDMI monitoru...")
