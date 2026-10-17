@@ -1,12 +1,53 @@
 #!/usr/bin/env python3
 import os
 import glob
+import time
 import argparse
+import threading
 import subprocess
 from urllib.parse import urlparse, parse_qs
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 PORT = 1111
+
+# --- OVLÁDÁNÍ ZVUKU ---
+def refresh_audio():
+    """Kompletně resetuje a znovu probudí zvukové subsystémy (ALSA, PipeWire, PulseAudio)."""
+    print("[AUDIO] Obnovuji zvukové subsystémy...")
+    commands = [
+        # Znovu ohlásit zvukový hardware v kernelu
+        "udevadm trigger --subsystem-match=sound",
+        # Obnovit stav ALSA
+        "alsactl init",
+        "alsactl restore",
+        # Restartovat WirePlumber / PipeWire (výchozí v moderním Raspberry Pi OS)
+        "pkill -x wireplumber",
+        "pkill -x pipewire",
+        # Restartovat PulseAudio (pokud běží starší systém)
+        "pulseaudio -k"
+    ]
+    for cmd in commands:
+        try:
+            subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    # Pokusit se nastavit výchozí výstup na HDMI, pokud je k dispozici
+    try:
+        cmd_sink = "pactl list sinks short | grep -i hdmi | head -n 1 | awk '{print $2}'"
+        res = subprocess.run(cmd_sink, shell=True, capture_output=True, text=True)
+        hdmi_sink = res.stdout.strip()
+        if hdmi_sink:
+            subprocess.run(f"pactl set-default-sink {hdmi_sink}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"[AUDIO] Výchozí sink nastaven na: {hdmi_sink}")
+    except Exception:
+        pass
+    print("[AUDIO] Obnovení zvuku dokončeno.")
+
+def delayed_audio_refresh():
+    """Počká 1.5 sekundy po zapnutí HDMI a poté restartuje zvuk."""
+    time.sleep(1.5)
+    refresh_audio()
 
 # --- OVLÁDÁNÍ HDMI ---
 def find_hdmi_status_path():
@@ -24,6 +65,10 @@ def set_hdmi(enable: bool) -> bool:
         with open(HDMI_STATUS_PATH, "w") as f:
             f.write(state_str + "\n")
         print(f"[HDMI] Monitor přepnut do stavu: {state_str.upper()}")
+        
+        # Při zapnutí HDMI automaticky na pozadí probudíme zvuk
+        if enable:
+            threading.Thread(target=delayed_audio_refresh, daemon=True).start()
         return True
     except Exception as e:
         print(f"[CHYBA] Zápis do {HDMI_STATUS_PATH} selhal: {e}")
@@ -105,7 +150,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             background-color: #0f172a;
             color: #f8fafc;
             margin: 0;
-            padding: 12px;
+            padding: 10px;
             height: 100vh;
             display: flex;
             flex-direction: column;
@@ -113,38 +158,45 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
         .header {
             display: flex;
+            flex-direction: column;
+            gap: 8px;
+            margin-bottom: 10px;
+        }
+        .header-top {
+            display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 12px;
-            gap: 8px;
         }
         .status-badge {
-            padding: 8px 12px;
+            padding: 6px 12px;
             border-radius: 8px;
             font-size: 0.85rem;
             font-weight: bold;
             color: __STATUS_COLOR__;
             border: 1px solid __STATUS_COLOR__;
-            white-space: nowrap;
         }
-        .hdmi-buttons {
+        .action-buttons {
             display: flex;
-            gap: 8px;
-            flex-grow: 1;
-            justify-content: flex-end;
+            gap: 6px;
+            width: 100%;
         }
-        .btn-hdmi {
-            padding: 8px 14px;
+        .btn-action {
+            flex: 1;
+            padding: 10px 4px;
             border-radius: 8px;
             font-size: 0.85rem;
             font-weight: bold;
             border: none;
             cursor: pointer;
             color: white;
+            text-align: center;
             text-decoration: none;
+            transition: opacity 0.2s;
         }
+        .btn-action:active { opacity: 0.8; }
         .btn-on { background-color: #16a34a; }
         .btn-off { background-color: #dc2626; }
+        .btn-audio { background-color: #2563eb; }
 
         #touchpad {
             flex: 1;
@@ -177,8 +229,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .mouse-buttons {
             display: flex;
             gap: 12px;
-            margin-top: 12px;
-            height: 65px;
+            margin-top: 10px;
+            height: 60px;
         }
         .btn-mouse {
             flex: 1;
@@ -198,10 +250,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
     <div class="header">
-        <div class="status-badge">HDMI: __STATUS_TEXT__</div>
-        <div class="hdmi-buttons">
-            <a href="/hdmi/on" class="btn-hdmi btn-on">Zapnout</a>
-            <a href="/hdmi/off" class="btn-hdmi btn-off">Vypnout</a>
+        <div class="header-top">
+            <div class="status-badge">HDMI: __STATUS_TEXT__</div>
+        </div>
+        <div class="action-buttons">
+            <a href="/hdmi/on" class="btn-action btn-on">Zapnout</a>
+            <a href="/hdmi/off" class="btn-action btn-off">Vypnout</a>
+            <button class="btn-action btn-audio" id="btn-audio" onclick="triggerAudioRefresh()">🔊 Zvuk</button>
         </div>
     </div>
 
@@ -277,6 +332,29 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             fetch('/api/mouse/click?btn=' + btn, { method: 'POST' });
         }
 
+        function triggerAudioRefresh() {
+            const btn = document.getElementById("btn-audio");
+            const originalText = btn.innerText;
+            btn.innerText = "⏳ Načítám...";
+            btn.disabled = true;
+
+            fetch('/api/audio/refresh', { method: 'POST' })
+                .then(() => {
+                    btn.innerText = "✓ Obnoveno";
+                    setTimeout(() => {
+                        btn.innerText = originalText;
+                        btn.disabled = false;
+                    }, 2000);
+                })
+                .catch(() => {
+                    btn.innerText = "Chyba";
+                    setTimeout(() => {
+                        btn.innerText = originalText;
+                        btn.disabled = false;
+                    }, 2000);
+                });
+        }
+
         document.getElementById("btn-left").addEventListener("click", () => sendClick('left'));
         document.getElementById("btn-right").addEventListener("click", () => sendClick('right'));
     </script>
@@ -297,6 +375,9 @@ class ServerHandler(BaseHTTPRequestHandler):
             self._redirect_home()
         elif path == "/hdmi/off":
             set_hdmi(False)
+            self._redirect_home()
+        elif path == "/audio/refresh":
+            refresh_audio()
             self._redirect_home()
         else:
             self.send_error(404)
@@ -319,6 +400,10 @@ class ServerHandler(BaseHTTPRequestHandler):
             btn = params.get("btn", ["left"])[0]
             mouse.click(btn)
             self._send_status(204)
+
+        elif path == "/api/audio/refresh":
+            refresh_audio()
+            self._send_status(200)
 
         elif path == "/hdmi/on":
             set_hdmi(True)
@@ -366,7 +451,7 @@ def run_server(port):
 
     server_address = ("", port)
     httpd = ThreadingHTTPServer(server_address, ServerHandler)
-    print(f"[SERVER] Běží na portu {port} (Touchpad + HDMI)")
+    print(f"[SERVER] Běží na portu {port} (Touchpad + HDMI + Audio)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
