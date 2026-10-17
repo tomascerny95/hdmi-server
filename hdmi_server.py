@@ -13,7 +13,7 @@ PORT = 1111
 USER = "cernytom"
 RUNTIME_DIR = "/run/user/1000"
 
-# --- ZJIŠTĚNÍ SKUTEČNÉHO ROZLIŠENÍ PLOCHY PŘES GRIM ---
+# --- ZJIŠTĚNÍ ROZLIŠENÍ PLOCHY ---
 def detect_desktop_resolution():
     temp = "/dev/shm/rpi_detect.png"
     try:
@@ -28,7 +28,6 @@ def detect_desktop_resolution():
             img = Image.open(temp)
             w, h = img.size
             os.remove(temp)
-            print(f"[SCREEN] Reálné rozlišení plochy: {w}x{h}")
             return w, h
     except Exception:
         pass
@@ -96,7 +95,7 @@ def get_hdmi_status() -> str:
     except Exception:
         return "neznámý"
 
-# --- OVLÁDÁNÍ MYŠI: ABSOLUTNÍ TABLET (100% SYNCHRONIZACE S OBRAZOVKOU) ---
+# --- OVLÁDÁNÍ MYŠI A KLÁVESNICE (EVDEV) ---
 try:
     import evdev
     from evdev import UInput, ecodes as e
@@ -104,43 +103,81 @@ try:
 except ImportError:
     HAS_EVDEV = False
 
-class MouseController:
+# Mapování základních kláves pro textový vstup
+CHAR_KEY_MAP = {}
+if HAS_EVDEV:
+    # Vygenerovat mapu písmen a číslic
+    for ch in "abcdefghijklmnopqrstuvwxyz":
+        key_name = f"KEY_{ch.upper()}"
+        if hasattr(e, key_name):
+            CHAR_KEY_MAP[ch] = (getattr(e, key_name), False)
+            CHAR_KEY_MAP[ch.upper()] = (getattr(e, key_name), True)
+
+    for i in range(10):
+        key_name = f"KEY_{i}"
+        if hasattr(e, key_name):
+            CHAR_KEY_MAP[str(i)] = (getattr(e, key_name), False)
+
+    CHAR_KEY_MAP.update({
+        ' ': (e.KEY_SPACE, False),
+        '\n': (e.KEY_ENTER, False),
+        '\t': (e.KEY_TAB, False),
+        '.': (e.KEY_DOT, False),
+        ',': (e.KEY_COMMA, False),
+        '-': (e.KEY_MINUS, False),
+        '_': (e.KEY_MINUS, True),
+        '/': (e.KEY_SLASH, False),
+        ':': (e.KEY_SEMICOLON, True),
+        ';': (e.KEY_SEMICOLON, False),
+        '=': (e.KEY_EQUAL, False),
+        '+': (e.KEY_EQUAL, True),
+        '?': (e.KEY_SLASH, True),
+        '!': (e.KEY_1, True),
+        '@': (e.KEY_2, True)
+    })
+
+SPECIAL_KEY_MAP = {}
+if HAS_EVDEV:
+    SPECIAL_KEY_MAP = {
+        'Enter': e.KEY_ENTER,
+        'Backspace': e.KEY_BACKSPACE,
+        'Tab': e.KEY_TAB,
+        'Esc': e.KEY_ESC,
+        'Space': e.KEY_SPACE,
+        'Up': e.KEY_UP,
+        'Down': e.KEY_DOWN,
+        'Left': e.KEY_LEFT,
+        'Right': e.KEY_RIGHT
+    }
+
+class InputController:
     def __init__(self):
         self.ui = None
         if HAS_EVDEV:
             try:
-                # Absolutní ukazatel - myš je natvrdo na pixel přesně tam, kde říká Python
+                # Zahrneme myš i všechny klávesy
+                all_keys = [getattr(e, k) for k in dir(e) if k.startswith("KEY_") or k.startswith("BTN_")]
                 cap = {
                     e.EV_ABS: [
                         (e.ABS_X, evdev.AbsInfo(value=cur_x, min=0, max=screen_width, fuzz=0, flat=0, resolution=1)),
                         (e.ABS_Y, evdev.AbsInfo(value=cur_y, min=0, max=screen_height, fuzz=0, flat=0, resolution=1))
                     ],
-                    e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE]
+                    e.EV_KEY: all_keys
                 }
-                self.ui = UInput(cap, name="RPi-Web-Touchpad-Abs")
-                print("[MOUSE] Inicializována absolutní virtuální myš (nulový drift).")
+                self.ui = UInput(cap, name="RPi-Web-Remote-Controller")
+                print("[INPUT] Virtuální myš a klávesnice úspěšně inicializována.")
             except Exception as ex:
-                print(f"[MOUSE] Chyba inicializace: {ex}")
+                print(f"[INPUT] Chyba inicializace: {ex}")
 
     def move_rel(self, dx: int, dy: int):
         global cur_x, cur_y
         with pos_lock:
             cur_x = max(0, min(screen_width, cur_x + dx))
             cur_y = max(0, min(screen_height, cur_y + dy))
-            self._sync()
-
-    def set_abs(self, x: int, y: int):
-        global cur_x, cur_y
-        with pos_lock:
-            cur_x = max(0, min(screen_width, x))
-            cur_y = max(0, min(screen_height, y))
-            self._sync()
-
-    def _sync(self):
-        if self.ui:
-            self.ui.write(e.EV_ABS, e.ABS_X, cur_x)
-            self.ui.write(e.EV_ABS, e.ABS_Y, cur_y)
-            self.ui.syn()
+            if self.ui:
+                self.ui.write(e.EV_ABS, e.ABS_X, cur_x)
+                self.ui.write(e.EV_ABS, e.ABS_Y, cur_y)
+                self.ui.syn()
 
     def click(self, button: str = "left"):
         if self.ui:
@@ -150,16 +187,39 @@ class MouseController:
             self.ui.write(e.EV_KEY, btn, 0)
             self.ui.syn()
 
-    def recenter(self):
-        self.set_abs(screen_width // 2, screen_height // 2)
+    def send_key(self, key_name: str):
+        if self.ui and key_name in SPECIAL_KEY_MAP:
+            code = SPECIAL_KEY_MAP[key_name]
+            self.ui.write(e.EV_KEY, code, 1)
+            self.ui.syn()
+            time.sleep(0.01)
+            self.ui.write(e.EV_KEY, code, 0)
+            self.ui.syn()
 
-mouse = MouseController()
+    def type_text(self, text: str):
+        if not self.ui:
+            return
+        for char in text:
+            if char in CHAR_KEY_MAP:
+                code, shift = CHAR_KEY_MAP[char]
+                if shift:
+                    self.ui.write(e.EV_KEY, e.KEY_LEFTSHIFT, 1)
+                self.ui.write(e.EV_KEY, code, 1)
+                self.ui.syn()
+                time.sleep(0.005)
+                self.ui.write(e.EV_KEY, code, 0)
+                if shift:
+                    self.ui.write(e.EV_KEY, e.KEY_LEFTSHIFT, 0)
+                self.ui.syn()
+                time.sleep(0.005)
 
-# --- SNÍMÁNÍ OBRAZOVKY (VÝŘEZ NEBO CELÁ OBRAZOVKA) ---
+controller = InputController()
+
+# --- SNÍMÁNÍ OBRAZOVKY (VÝŘEZ) ---
 last_capture_time = 0
 cached_image_bytes = None
 
-def capture_screen(req_w, req_h, mode="crop"):
+def capture_screen(req_w, req_h):
     global last_capture_time, cached_image_bytes
 
     now = time.time()
@@ -171,32 +231,28 @@ def capture_screen(req_w, req_h, mode="crop"):
     with pos_lock:
         mx, my = cur_x, cur_y
 
-    if mode == "full":
-        # Celá obrazovka
-        geom_cmd = []
-    else:
-        # Zvětšený výřez s myší uprostřed
-        crop_w = max(320, min(screen_width, req_w))
-        crop_h = max(240, min(screen_height, req_h))
+    crop_w = max(320, min(screen_width, req_w))
+    crop_h = max(240, min(screen_height, req_h))
 
-        ideal_x1 = mx - crop_w // 2
-        ideal_y1 = my - crop_h // 2
-        src_x1 = max(0, ideal_x1)
-        src_y1 = max(0, ideal_y1)
-        src_x2 = min(screen_width, ideal_x1 + crop_w)
-        src_y2 = min(screen_height, ideal_y1 + crop_h)
+    ideal_x1 = mx - crop_w // 2
+    ideal_y1 = my - crop_h // 2
+    src_x1 = max(0, ideal_x1)
+    src_y1 = max(0, ideal_y1)
+    src_x2 = min(screen_width, ideal_x1 + crop_w)
+    src_y2 = min(screen_height, ideal_y1 + crop_h)
 
-        grab_w = src_x2 - src_x1
-        grab_h = src_y2 - src_y1
-        if grab_w <= 0 or grab_h <= 0:
-            return cached_image_bytes
-        geom_cmd = ["-g", f"{src_x1},{src_y1} {grab_w}x{grab_h}"]
+    grab_w = src_x2 - src_x1
+    grab_h = src_y2 - src_y1
+    if grab_w <= 0 or grab_h <= 0:
+        return cached_image_bytes
+
+    geom = f"{src_x1},{src_y1} {grab_w}x{grab_h}"
 
     cmd = [
         "runuser", "-u", USER, "--",
         "env", f"XDG_RUNTIME_DIR={RUNTIME_DIR}", "WAYLAND_DISPLAY=wayland-0",
-        "grim", "-c"
-    ] + geom_cmd + [temp_raw] if os.getuid() == 0 else ["grim", "-c"] + geom_cmd + [temp_raw]
+        "grim", "-c", "-g", geom, temp_raw
+    ] if os.getuid() == 0 else ["grim", "-c", "-g", geom, temp_raw]
 
     try:
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1)
@@ -204,23 +260,14 @@ def capture_screen(req_w, req_h, mode="crop"):
             return cached_image_bytes
 
         img = Image.open(temp_raw)
+        canvas = Image.new("RGB", (crop_w, crop_h), (11, 17, 32))
+        paste_x = src_x1 - ideal_x1
+        paste_y = src_y1 - ideal_y1
+        canvas.paste(img, (paste_x, paste_y))
 
-        if mode == "full":
-            buf = io.BytesIO()
-            # Mírná komprese pro plynulý náhled celé plochy
-            img.thumbnail((720, 480))
-            img.convert("RGB").save(buf, format="JPEG", quality=50, optimize=False)
-            cached_image_bytes = buf.getvalue()
-        else:
-            canvas = Image.new("RGB", (crop_w, crop_h), (11, 17, 32))
-            paste_x = src_x1 - ideal_x1
-            paste_y = src_y1 - ideal_y1
-            canvas.paste(img, (paste_x, paste_y))
-
-            buf = io.BytesIO()
-            canvas.save(buf, format="JPEG", quality=55, optimize=False)
-            cached_image_bytes = buf.getvalue()
-
+        buf = io.BytesIO()
+        canvas.save(buf, format="JPEG", quality=55, optimize=False)
+        cached_image_bytes = buf.getvalue()
         last_capture_time = now
         return cached_image_bytes
 
@@ -253,6 +300,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             padding: 4px 8px; border-radius: 6px; font-size: 0.8rem; font-weight: bold;
             color: __STATUS_COLOR__; border: 1px solid __STATUS_COLOR__;
         }
+        .top-tools { display: flex; gap: 6px; }
         .action-buttons { display: flex; gap: 6px; width: 100%; }
         .btn-action {
             flex: 1; padding: 8px 4px; border-radius: 8px; font-size: 0.8rem; font-weight: bold;
@@ -261,8 +309,45 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .btn-on { background-color: #16a34a; }
         .btn-off { background-color: #dc2626; }
         .btn-audio { background-color: #2563eb; }
-        .btn-mode { background-color: #7c3aed; }
-        .btn-center { background-color: #f59e0b; }
+        
+        /* 3 NOVÁ TLAČÍTKA */
+        .btn-kbd { background-color: #0ea5e9; }
+        .btn-stream { background-color: #7c3aed; }
+        .btn-close { background-color: #991b1b; }
+
+        /* VYSOUVACÍ LIŠTA KLÁVESNICE */
+        #keyboard-panel {
+            display: none;
+            background: #1e293b;
+            padding: 8px;
+            border-radius: 10px;
+            margin-bottom: 6px;
+            flex-direction: column;
+            gap: 6px;
+            border: 1px solid #334155;
+        }
+        .kbd-row { display: flex; gap: 6px; }
+        #kbd-input {
+            flex: 1;
+            padding: 8px 12px;
+            border-radius: 8px;
+            border: 1px solid #475569;
+            background: #0f172a;
+            color: white;
+            font-size: 1rem;
+            outline: none;
+        }
+        .btn-kbd-key {
+            padding: 6px 12px;
+            border-radius: 8px;
+            border: 1px solid #475569;
+            background: #334155;
+            color: white;
+            font-size: 0.85rem;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .btn-kbd-key:active { background: #38bdf8; color: black; }
 
         #touchpad {
             flex: 1 1 0;
@@ -293,9 +378,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="header">
         <div class="header-top">
             <div class="status-badge">HDMI: __STATUS_TEXT__</div>
-            <div style="display:flex; gap:6px;">
-                <button class="btn-action btn-center" onclick="recenterMouse()">🎯 Střed</button>
-                <button class="btn-action btn-mode" id="btn-mode" onclick="toggleViewMode()">🖥️ Celá plocha</button>
+            <div class="top-tools">
+                <button class="btn-action btn-kbd" onclick="toggleKeyboard()">⌨️ Klávesnice</button>
+                <button class="btn-action btn-stream" id="btn-stream" onclick="toggleStream()">👁️ Obraz: ZAP</button>
+                <button class="btn-action btn-close" onclick="closeApp()">❌ Zavřít</button>
             </div>
         </div>
         <div class="action-buttons">
@@ -303,10 +389,24 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <a href="/hdmi/off" class="btn-action btn-off">Vypnout</a>
             <button class="btn-action btn-audio" id="btn-audio" onclick="triggerAudioRefresh()">🔊 Zvuk</button>
         </div>
+
+        <!-- LIŠTA PRO PSANÍ NA KLÁVESNICI -->
+        <div id="keyboard-panel">
+            <form onsubmit="submitText(event)" class="kbd-row">
+                <input type="text" id="kbd-input" placeholder="Zde pište text do Raspberry..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+                <button type="submit" class="btn-kbd-key" style="background:#0ea5e9;">Odeslat</button>
+            </form>
+            <div class="kbd-row">
+                <button class="btn-kbd-key" style="flex:1;" onclick="sendKey('Enter')">↵ Enter</button>
+                <button class="btn-kbd-key" style="flex:1;" onclick="sendKey('Backspace')">⌫ Smazat</button>
+                <button class="btn-kbd-key" style="flex:1;" onclick="sendKey('Tab')">Tab</button>
+                <button class="btn-kbd-key" style="flex:1;" onclick="sendKey('Esc')">Esc</button>
+            </div>
+        </div>
     </div>
 
     <div id="touchpad">
-        <img id="screen-view" src="/api/screen/view?w=360&h=480&mode=crop" alt="">
+        <img id="screen-view" src="/api/screen/crop?w=360&h=480" alt="">
     </div>
 
     <div class="mouse-buttons">
@@ -317,9 +417,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <script>
         const pad = document.getElementById("touchpad");
         const screenView = document.getElementById("screen-view");
-        const btnMode = document.getElementById("btn-mode");
+        const btnStream = document.getElementById("btn-stream");
+        const kbdPanel = document.getElementById("keyboard-panel");
+        const kbdInput = document.getElementById("kbd-input");
 
-        let viewMode = "crop"; // "crop" nebo "full"
+        let streamEnabled = true;
         let isFetchingScreen = false;
         let fetchWatchdog = null;
         const SENSITIVITY = 1.4;
@@ -345,7 +447,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         setInterval(flushMove, 25);
 
         function updateScreen() {
-            if (isFetchingScreen) return;
+            if (!streamEnabled || isFetchingScreen) return;
             isFetchingScreen = true;
 
             clearTimeout(fetchWatchdog);
@@ -360,37 +462,66 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 isFetchingScreen = false;
             };
             nextImg.onerror = () => { isFetchingScreen = false; };
-            nextImg.src = `/api/screen/view?w=${w}&h=${h}&mode=${viewMode}&t=${Date.now()}`;
+            nextImg.src = `/api/screen/crop?w=${w}&h=${h}&t=${Date.now()}`;
         }
         setInterval(updateScreen, 120);
 
-        function toggleViewMode() {
-            if (viewMode === "crop") {
-                viewMode = "full";
-                btnMode.innerText = "🔍 Lupa";
-                btnMode.style.backgroundColor = "#2563eb";
+        // 1. OTEVŘÍT KLÁVESNICI
+        function toggleKeyboard() {
+            if (kbdPanel.style.display === "flex") {
+                kbdPanel.style.display = "none";
+                kbdInput.blur();
             } else {
-                viewMode = "crop";
-                btnMode.innerText = "🖥️ Celá plocha";
-                btnMode.style.backgroundColor = "#7c3aed";
+                kbdPanel.style.display = "flex";
+                setTimeout(() => kbdInput.focus(), 50);
             }
-            updateScreen();
         }
 
-        function recenterMouse() {
-            fetch('/api/mouse/center', { method: 'POST' })
-                .then(() => setTimeout(updateScreen, 50));
+        function submitText(e) {
+            e.preventDefault();
+            const text = kbdInput.value;
+            if (text) {
+                fetch('/api/keyboard/text', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text: text })
+                });
+                kbdInput.value = "";
+            }
+            setTimeout(updateScreen, 80);
         }
 
-        // V režimu Celá plocha: klepnutí skočí přímo na dané místo
-        function handleAbsoluteTap(clientX, clientY) {
-            if (viewMode !== "full") return false;
-            const rect = pad.getBoundingClientRect();
-            const relX = (clientX - rect.left) / rect.width;
-            const relY = (clientY - rect.top) / rect.height;
-            fetch(`/api/mouse/abs?rx=${relX}&ry=${relY}`, { method: 'POST' })
-                .then(() => setTimeout(updateScreen, 50));
-            return true;
+        function sendKey(keyName) {
+            fetch('/api/keyboard/key?key=' + keyName, { method: 'POST' });
+            setTimeout(updateScreen, 80);
+        }
+
+        // 2. VYPNOUT / ZAPNOUT OBRAZ
+        function toggleStream() {
+            streamEnabled = !streamEnabled;
+            if (streamEnabled) {
+                btnStream.innerText = "👁️ Obraz: ZAP";
+                btnStream.style.backgroundColor = "#7c3aed";
+                screenView.style.display = "block";
+                updateScreen();
+            } else {
+                btnStream.innerText = "👁️ Obraz: VYP";
+                btnStream.style.backgroundColor = "#475569";
+                screenView.style.display = "none";
+            }
+        }
+
+        // 3. ZAVŘÍT CELOU STRÁNKU
+        function closeApp() {
+            if (confirm("Chcete stránku zavřít?")) {
+                window.open('', '_self', '');
+                window.close();
+                document.body.innerHTML = `
+                    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100dvh;color:#94a3b8;font-size:1.2rem;text-align:center;padding:20px;">
+                        <span>Stránka byla ukončena.</span>
+                        <span style="font-size:0.9rem;margin-top:10px;color:#64748b;">Nyní můžete zavřít tuto záložku v prohlížeči.</span>
+                    </div>`;
+            }
         }
 
         // Dotyk
@@ -416,9 +547,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             pad.classList.remove("active");
             const dist = Math.hypot(lastX - startX, lastY - startY);
             if (dist < 8 && (Date.now() - startTime) < 250) {
-                if (!handleAbsoluteTap(lastX, lastY)) {
-                    sendClick('left');
-                }
+                sendClick('left');
             }
             setTimeout(updateScreen, 40);
         }, { passive: false });
@@ -445,9 +574,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             pad.classList.remove("active");
             const dist = Math.hypot(lastX - startX, lastY - startY);
             if (dist < 8 && (Date.now() - startTime) < 250) {
-                if (!handleAbsoluteTap(lastX, lastY)) {
-                    sendClick('left');
-                }
+                sendClick('left');
             }
             setTimeout(updateScreen, 40);
         });
@@ -485,16 +612,15 @@ class ServerHandler(BaseHTTPRequestHandler):
 
         if path == "/":
             self._serve_dashboard()
-        elif path in ["/api/screen/view", "/api/screen/crop"]:
+        elif path in ["/api/screen/crop", "/api/screen/view"]:
             params = parse_qs(parsed.query)
             try:
                 w = int(params.get("w", [360])[0])
                 h = int(params.get("h", [480])[0])
             except Exception:
                 w, h = 360, 480
-            mode = params.get("mode", ["crop"])[0]
 
-            data = capture_screen(w, h, mode)
+            data = capture_screen(w, h)
             if data:
                 self.send_response(200)
                 self.send_header("Content-Type", "image/jpeg")
@@ -525,28 +651,34 @@ class ServerHandler(BaseHTTPRequestHandler):
             try:
                 dx = int(params.get("dx", [0])[0])
                 dy = int(params.get("dy", [0])[0])
-                mouse.move_rel(dx, dy)
-                self._send_status(204)
-            except Exception:
-                self._send_status(400)
-
-        elif path == "/api/mouse/abs":
-            try:
-                rx = float(params.get("rx", [0.5])[0])
-                ry = float(params.get("ry", [0.5])[0])
-                mouse.set_abs(int(rx * screen_width), int(ry * screen_height))
+                controller.move_rel(dx, dy)
                 self._send_status(204)
             except Exception:
                 self._send_status(400)
 
         elif path == "/api/mouse/click":
             btn = params.get("btn", ["left"])[0]
-            mouse.click(btn)
+            controller.click(btn)
             self._send_status(204)
 
-        elif path == "/api/mouse/center":
-            mouse.recenter()
+        elif path == "/api/keyboard/key":
+            key_name = params.get("key", [""])[0]
+            if key_name:
+                controller.send_key(key_name)
             self._send_status(204)
+
+        elif path == "/api/keyboard/text":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length).decode("utf-8")
+                import json
+                data = json.loads(body)
+                text = data.get("text", "")
+                if text:
+                    controller.type_text(text)
+                self._send_status(204)
+            except Exception:
+                self._send_status(400)
 
         elif path == "/api/audio/refresh":
             refresh_audio()
@@ -590,7 +722,7 @@ def run_server(port):
 
     server_address = ("", port)
     httpd = ThreadingHTTPServer(server_address, ServerHandler)
-    print(f"[SERVER] Běží na portu {port} (Absolutní tablet + Celá plocha / Lupa)")
+    print(f"[SERVER] Běží na portu {port} (Touchpad + Klávesnice + Stream ON/OFF + Zavřít)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
