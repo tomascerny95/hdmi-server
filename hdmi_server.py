@@ -103,22 +103,40 @@ try:
 except ImportError:
     HAS_EVDEV = False
 
-# Mapování základních kláves pro textový vstup
 CHAR_KEY_MAP = {}
+SPECIAL_KEY_MAP = {}
+VALID_KEY_CODES = []
+
 if HAS_EVDEV:
-    # Vygenerovat mapu písmen a číslic
+    # 1. Speciální klávesy
+    SPECIAL_KEY_MAP = {
+        'Enter': e.KEY_ENTER,
+        'Backspace': e.KEY_BACKSPACE,
+        'Tab': e.KEY_TAB,
+        'Esc': e.KEY_ESC,
+        'Space': e.KEY_SPACE,
+        'Up': e.KEY_UP,
+        'Down': e.KEY_DOWN,
+        'Left': e.KEY_LEFT,
+        'Right': e.KEY_RIGHT
+    }
+
+    # 2. Písmena a čísla
     for ch in "abcdefghijklmnopqrstuvwxyz":
-        key_name = f"KEY_{ch.upper()}"
-        if hasattr(e, key_name):
-            CHAR_KEY_MAP[ch] = (getattr(e, key_name), False)
-            CHAR_KEY_MAP[ch.upper()] = (getattr(e, key_name), True)
+        key_code = getattr(e, f"KEY_{ch.upper()}", None)
+        if key_code:
+            CHAR_KEY_MAP[ch] = (key_code, False)
+            CHAR_KEY_MAP[ch.upper()] = (key_code, True)
+            VALID_KEY_CODES.append(key_code)
 
     for i in range(10):
-        key_name = f"KEY_{i}"
-        if hasattr(e, key_name):
-            CHAR_KEY_MAP[str(i)] = (getattr(e, key_name), False)
+        key_code = getattr(e, f"KEY_{i}", None)
+        if key_code:
+            CHAR_KEY_MAP[str(i)] = (key_code, False)
+            VALID_KEY_CODES.append(key_code)
 
-    CHAR_KEY_MAP.update({
+    # 3. Znaky
+    symbols = {
         ' ': (e.KEY_SPACE, False),
         '\n': (e.KEY_ENTER, False),
         '\t': (e.KEY_TAB, False),
@@ -132,58 +150,51 @@ if HAS_EVDEV:
         '=': (e.KEY_EQUAL, False),
         '+': (e.KEY_EQUAL, True),
         '?': (e.KEY_SLASH, True),
-        '!': (e.KEY_1, True),
-        '@': (e.KEY_2, True)
-    })
-
-SPECIAL_KEY_MAP = {}
-if HAS_EVDEV:
-    SPECIAL_KEY_MAP = {
-        'Enter': e.KEY_ENTER,
-        'Backspace': e.KEY_BACKSPACE,
-        'Tab': e.KEY_TAB,
-        'Esc': e.KEY_ESC,
-        'Space': e.KEY_SPACE,
-        'Up': e.KEY_UP,
-        'Down': e.KEY_DOWN,
-        'Left': e.KEY_LEFT,
-        'Right': e.KEY_RIGHT
+        '!': (e.KEY_1, True)
     }
+    CHAR_KEY_MAP.update(symbols)
+
+    VALID_KEY_CODES.extend([
+        e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE,
+        e.KEY_LEFTSHIFT, e.KEY_ENTER, e.KEY_BACKSPACE,
+        e.KEY_TAB, e.KEY_ESC, e.KEY_SPACE, e.KEY_DOT,
+        e.KEY_COMMA, e.KEY_MINUS, e.KEY_SLASH, e.KEY_SEMICOLON,
+        e.KEY_EQUAL, e.KEY_UP, e.KEY_DOWN, e.KEY_LEFT, e.KEY_RIGHT
+    ])
+    VALID_KEY_CODES = list(set(VALID_KEY_CODES))
 
 class InputController:
     def __init__(self):
         self.ui = None
         if HAS_EVDEV:
             try:
-                # Zahrneme myš i všechny klávesy
-                all_keys = [getattr(e, k) for k in dir(e) if k.startswith("KEY_") or k.startswith("BTN_")]
+                # Osvědčená relativní myš + bezpečný seznam kláves
                 cap = {
-                    e.EV_ABS: [
-                        (e.ABS_X, evdev.AbsInfo(value=cur_x, min=0, max=screen_width, fuzz=0, flat=0, resolution=1)),
-                        (e.ABS_Y, evdev.AbsInfo(value=cur_y, min=0, max=screen_height, fuzz=0, flat=0, resolution=1))
-                    ],
-                    e.EV_KEY: all_keys
+                    e.EV_REL: [e.REL_X, e.REL_Y, e.REL_WHEEL],
+                    e.EV_KEY: VALID_KEY_CODES
                 }
-                self.ui = UInput(cap, name="RPi-Web-Remote-Controller")
-                print("[INPUT] Virtuální myš a klávesnice úspěšně inicializována.")
+                self.ui = UInput(cap, name="RPi-Web-Remote-Touchpad")
+                print("[INPUT] Ovladač myši a klávesnice úspěšně vytvořen.")
             except Exception as ex:
-                print(f"[INPUT] Chyba inicializace: {ex}")
+                print(f"[INPUT] Chyba inicializace evdev: {ex}")
 
-    def move_rel(self, dx: int, dy: int):
+    def move(self, dx: int, dy: int):
         global cur_x, cur_y
         with pos_lock:
             cur_x = max(0, min(screen_width, cur_x + dx))
             cur_y = max(0, min(screen_height, cur_y + dy))
-            if self.ui:
-                self.ui.write(e.EV_ABS, e.ABS_X, cur_x)
-                self.ui.write(e.EV_ABS, e.ABS_Y, cur_y)
-                self.ui.syn()
+
+        if self.ui:
+            self.ui.write(e.EV_REL, e.REL_X, dx)
+            self.ui.write(e.EV_REL, e.REL_Y, dy)
+            self.ui.syn()
 
     def click(self, button: str = "left"):
         if self.ui:
             btn = e.BTN_LEFT if button == "left" else e.BTN_RIGHT
             self.ui.write(e.EV_KEY, btn, 1)
             self.ui.syn()
+            time.sleep(0.01)
             self.ui.write(e.EV_KEY, btn, 0)
             self.ui.syn()
 
@@ -215,7 +226,7 @@ class InputController:
 
 controller = InputController()
 
-# --- SNÍMÁNÍ OBRAZOVKY (VÝŘEZ) ---
+# --- SNÍMÁNÍ OBRAZOVKY ---
 last_capture_time = 0
 cached_image_bytes = None
 
@@ -309,13 +320,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .btn-on { background-color: #16a34a; }
         .btn-off { background-color: #dc2626; }
         .btn-audio { background-color: #2563eb; }
-        
-        /* 3 NOVÁ TLAČÍTKA */
         .btn-kbd { background-color: #0ea5e9; }
         .btn-stream { background-color: #7c3aed; }
         .btn-close { background-color: #991b1b; }
 
-        /* VYSOUVACÍ LIŠTA KLÁVESNICE */
         #keyboard-panel {
             display: none;
             background: #1e293b;
@@ -328,24 +336,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
         .kbd-row { display: flex; gap: 6px; }
         #kbd-input {
-            flex: 1;
-            padding: 8px 12px;
-            border-radius: 8px;
-            border: 1px solid #475569;
-            background: #0f172a;
-            color: white;
-            font-size: 1rem;
-            outline: none;
+            flex: 1; padding: 8px 12px; border-radius: 8px; border: 1px solid #475569;
+            background: #0f172a; color: white; font-size: 1rem; outline: none;
         }
         .btn-kbd-key {
-            padding: 6px 12px;
-            border-radius: 8px;
-            border: 1px solid #475569;
-            background: #334155;
-            color: white;
-            font-size: 0.85rem;
-            font-weight: bold;
-            cursor: pointer;
+            padding: 6px 12px; border-radius: 8px; border: 1px solid #475569;
+            background: #334155; color: white; font-size: 0.85rem; font-weight: bold; cursor: pointer;
         }
         .btn-kbd-key:active { background: #38bdf8; color: black; }
 
@@ -358,9 +354,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             border: 2px solid #334155;
             overflow: hidden;
             touch-action: none;
-            display: flex;
-            align-items: center;
-            justify-content: center;
+            cursor: crosshair;
         }
         #touchpad.active { border-color: #38bdf8; }
         #screen-view {
@@ -390,7 +384,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <button class="btn-action btn-audio" id="btn-audio" onclick="triggerAudioRefresh()">🔊 Zvuk</button>
         </div>
 
-        <!-- LIŠTA PRO PSANÍ NA KLÁVESNICI -->
         <div id="keyboard-panel">
             <form onsubmit="submitText(event)" class="kbd-row">
                 <input type="text" id="kbd-input" placeholder="Zde pište text do Raspberry..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
@@ -466,7 +459,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
         setInterval(updateScreen, 120);
 
-        // 1. OTEVŘÍT KLÁVESNICI
         function toggleKeyboard() {
             if (kbdPanel.style.display === "flex") {
                 kbdPanel.style.display = "none";
@@ -496,7 +488,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             setTimeout(updateScreen, 80);
         }
 
-        // 2. VYPNOUT / ZAPNOUT OBRAZ
         function toggleStream() {
             streamEnabled = !streamEnabled;
             if (streamEnabled) {
@@ -511,20 +502,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        // 3. ZAVŘÍT CELOU STRÁNKU
         function closeApp() {
             if (confirm("Chcete stránku zavřít?")) {
                 window.open('', '_self', '');
                 window.close();
                 document.body.innerHTML = `
                     <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100dvh;color:#94a3b8;font-size:1.2rem;text-align:center;padding:20px;">
-                        <span>Stránka byla ukončena.</span>
+                        <span>Aplikace byla ukončena.</span>
                         <span style="font-size:0.9rem;margin-top:10px;color:#64748b;">Nyní můžete zavřít tuto záložku v prohlížeči.</span>
                     </div>`;
             }
         }
 
-        // Dotyk
+        // Dotykové ovládání (mobil)
         pad.addEventListener("touchstart", (e) => {
             e.preventDefault();
             pad.classList.add("active");
@@ -552,7 +542,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             setTimeout(updateScreen, 40);
         }, { passive: false });
 
-        // Myš (PC)
+        // Ovládání pro PC myš
         pad.addEventListener("mousedown", (e) => {
             isMouseDown = true;
             pad.classList.add("active");
@@ -651,7 +641,7 @@ class ServerHandler(BaseHTTPRequestHandler):
             try:
                 dx = int(params.get("dx", [0])[0])
                 dy = int(params.get("dy", [0])[0])
-                controller.move_rel(dx, dy)
+                controller.move(dx, dy)
                 self._send_status(204)
             except Exception:
                 self._send_status(400)
@@ -722,7 +712,7 @@ def run_server(port):
 
     server_address = ("", port)
     httpd = ThreadingHTTPServer(server_address, ServerHandler)
-    print(f"[SERVER] Běží na portu {port} (Touchpad + Klávesnice + Stream ON/OFF + Zavřít)")
+    print(f"[SERVER] Běží na portu {port} (Plně funkční Touchpad + Klávesnice)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
