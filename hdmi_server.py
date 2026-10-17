@@ -28,10 +28,10 @@ def detect_desktop_resolution():
             img = Image.open(temp)
             w, h = img.size
             os.remove(temp)
-            print(f"[SCREEN] Zjištěno přesné rozlišení plochy: {w}x{h}")
+            print(f"[SCREEN] Reálné rozlišení plochy: {w}x{h}")
             return w, h
-    except Exception as e:
-        print(f"[SCREEN] Detekce selhala ({e}), použito výchozí 1920x1080")
+    except Exception:
+        pass
     return 1920, 1080
 
 screen_width, screen_height = detect_desktop_resolution()
@@ -41,7 +41,6 @@ pos_lock = threading.Lock()
 
 # --- OVLÁDÁNÍ ZVUKU ---
 def refresh_audio():
-    print("[AUDIO] Obnovuji zvuk...")
     commands = [
         "udevadm trigger --subsystem-match=sound",
         "alsactl init",
@@ -55,7 +54,6 @@ def refresh_audio():
             subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
-
     try:
         cmd_sink = f"runuser -u {USER} -- env XDG_RUNTIME_DIR={RUNTIME_DIR} pactl list sinks short | grep -i hdmi | head -n 1 | awk '{{print $2}}'"
         res = subprocess.run(cmd_sink, shell=True, capture_output=True, text=True)
@@ -64,7 +62,6 @@ def refresh_audio():
             subprocess.run(f"runuser -u {USER} -- env XDG_RUNTIME_DIR={RUNTIME_DIR} pactl set-default-sink {hdmi_sink}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
-    print("[AUDIO] Zvuk obnoven.")
 
 def delayed_audio_refresh():
     time.sleep(1.5)
@@ -86,12 +83,10 @@ def set_hdmi(enable: bool) -> bool:
     try:
         with open(HDMI_STATUS_PATH, "w") as f:
             f.write(state_str + "\n")
-        print(f"[HDMI] Monitor: {state_str.upper()}")
         if enable:
             threading.Thread(target=delayed_audio_refresh, daemon=True).start()
         return True
-    except Exception as e:
-        print(f"[CHYBA] HDMI: {e}")
+    except Exception:
         return False
 
 def get_hdmi_status() -> str:
@@ -101,7 +96,7 @@ def get_hdmi_status() -> str:
     except Exception:
         return "neznámý"
 
-# --- OVLÁDÁNÍ MYŠI (EVDEV) ---
+# --- OVLÁDÁNÍ MYŠI: ABSOLUTNÍ TABLET (100% SYNCHRONIZACE S OBRAZOVKOU) ---
 try:
     import evdev
     from evdev import UInput, ecodes as e
@@ -114,23 +109,37 @@ class MouseController:
         self.ui = None
         if HAS_EVDEV:
             try:
+                # Absolutní ukazatel - myš je natvrdo na pixel přesně tam, kde říká Python
                 cap = {
-                    e.EV_REL: [e.REL_X, e.REL_Y, e.REL_WHEEL],
+                    e.EV_ABS: [
+                        (e.ABS_X, evdev.AbsInfo(value=cur_x, min=0, max=screen_width, fuzz=0, flat=0, resolution=1)),
+                        (e.ABS_Y, evdev.AbsInfo(value=cur_y, min=0, max=screen_height, fuzz=0, flat=0, resolution=1))
+                    ],
                     e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE]
                 }
-                self.ui = UInput(cap, name="RPi-Web-Touchpad")
-            except Exception:
-                pass
+                self.ui = UInput(cap, name="RPi-Web-Touchpad-Abs")
+                print("[MOUSE] Inicializována absolutní virtuální myš (nulový drift).")
+            except Exception as ex:
+                print(f"[MOUSE] Chyba inicializace: {ex}")
 
-    def move(self, dx: int, dy: int):
+    def move_rel(self, dx: int, dy: int):
         global cur_x, cur_y
         with pos_lock:
             cur_x = max(0, min(screen_width, cur_x + dx))
             cur_y = max(0, min(screen_height, cur_y + dy))
+            self._sync()
 
+    def set_abs(self, x: int, y: int):
+        global cur_x, cur_y
+        with pos_lock:
+            cur_x = max(0, min(screen_width, x))
+            cur_y = max(0, min(screen_height, y))
+            self._sync()
+
+    def _sync(self):
         if self.ui:
-            self.ui.write(e.EV_REL, e.REL_X, dx)
-            self.ui.write(e.EV_REL, e.REL_Y, dy)
+            self.ui.write(e.EV_ABS, e.ABS_X, cur_x)
+            self.ui.write(e.EV_ABS, e.ABS_Y, cur_y)
             self.ui.syn()
 
     def click(self, button: str = "left"):
@@ -142,87 +151,76 @@ class MouseController:
             self.ui.syn()
 
     def recenter(self):
-        global cur_x, cur_y
-        with pos_lock:
-            cur_x = screen_width // 2
-            cur_y = screen_height // 2
-
-        if self.ui:
-            for _ in range(4):
-                self.ui.write(e.EV_REL, e.REL_X, -1000)
-                self.ui.write(e.EV_REL, e.REL_Y, -1000)
-                self.ui.syn()
-                time.sleep(0.005)
-            self.ui.write(e.EV_REL, e.REL_X, screen_width // 2)
-            self.ui.write(e.EV_REL, e.REL_Y, screen_height // 2)
-            self.ui.syn()
+        self.set_abs(screen_width // 2, screen_height // 2)
 
 mouse = MouseController()
 
-# --- SNÍMÁNÍ OBRAZOVKY: MYŠ JE VŽDY 100% VYCENTROVANÁ ---
+# --- SNÍMÁNÍ OBRAZOVKY (VÝŘEZ NEBO CELÁ OBRAZOVKA) ---
 last_capture_time = 0
 cached_image_bytes = None
 
-def capture_centered_crop(req_w, req_h):
+def capture_screen(req_w, req_h, mode="crop"):
     global last_capture_time, cached_image_bytes
 
     now = time.time()
-    if cached_image_bytes and (now - last_capture_time < 0.06):
+    if cached_image_bytes and (now - last_capture_time < 0.05):
         return cached_image_bytes
 
     temp_raw = "/dev/shm/rpi_crop.png"
 
-    # Rozměry přesně podle okna touchpadu na telefonu
-    crop_w = max(240, min(screen_width, req_w))
-    crop_h = max(240, min(screen_height, req_h))
-
     with pos_lock:
         mx, my = cur_x, cur_y
 
-    # Ideální souřadnice výřezu tak, aby (mx, my) bylo v crop_w//2, crop_h//2
-    ideal_x1 = mx - crop_w // 2
-    ideal_y1 = my - crop_h // 2
-    ideal_x2 = ideal_x1 + crop_w
-    ideal_y2 = ideal_y1 + crop_h
+    if mode == "full":
+        # Celá obrazovka
+        geom_cmd = []
+    else:
+        # Zvětšený výřez s myší uprostřed
+        crop_w = max(320, min(screen_width, req_w))
+        crop_h = max(240, min(screen_height, req_h))
 
-    # Reálný průnik s plochou monitoru
-    src_x1 = max(0, ideal_x1)
-    src_y1 = max(0, ideal_y1)
-    src_x2 = min(screen_width, ideal_x2)
-    src_y2 = min(screen_height, ideal_y2)
+        ideal_x1 = mx - crop_w // 2
+        ideal_y1 = my - crop_h // 2
+        src_x1 = max(0, ideal_x1)
+        src_y1 = max(0, ideal_y1)
+        src_x2 = min(screen_width, ideal_x1 + crop_w)
+        src_y2 = min(screen_height, ideal_y1 + crop_h)
 
-    grab_w = src_x2 - src_x1
-    grab_h = src_y2 - src_y1
-
-    if grab_w <= 0 or grab_h <= 0:
-        return cached_image_bytes
-
-    geom = f"{src_x1},{src_y1} {grab_w}x{grab_h}"
+        grab_w = src_x2 - src_x1
+        grab_h = src_y2 - src_y1
+        if grab_w <= 0 or grab_h <= 0:
+            return cached_image_bytes
+        geom_cmd = ["-g", f"{src_x1},{src_y1} {grab_w}x{grab_h}"]
 
     cmd = [
         "runuser", "-u", USER, "--",
         "env", f"XDG_RUNTIME_DIR={RUNTIME_DIR}", "WAYLAND_DISPLAY=wayland-0",
-        "grim", "-c", "-g", geom, temp_raw
-    ] if os.getuid() == 0 else ["grim", "-c", "-g", geom, temp_raw]
+        "grim", "-c"
+    ] + geom_cmd + [temp_raw] if os.getuid() == 0 else ["grim", "-c"] + geom_cmd + [temp_raw]
 
     try:
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1)
         if not os.path.exists(temp_raw):
             return cached_image_bytes
 
-        cropped_img = Image.open(temp_raw)
+        img = Image.open(temp_raw)
 
-        # Plátno v barvě pozadí (pro okraje za monitorem)
-        canvas = Image.new("RGB", (crop_w, crop_h), (15, 23, 42))
+        if mode == "full":
+            buf = io.BytesIO()
+            # Mírná komprese pro plynulý náhled celé plochy
+            img.thumbnail((720, 480))
+            img.convert("RGB").save(buf, format="JPEG", quality=50, optimize=False)
+            cached_image_bytes = buf.getvalue()
+        else:
+            canvas = Image.new("RGB", (crop_w, crop_h), (11, 17, 32))
+            paste_x = src_x1 - ideal_x1
+            paste_y = src_y1 - ideal_y1
+            canvas.paste(img, (paste_x, paste_y))
 
-        # Umístění snímku tak, aby myš byla VŽDY v přesném středu plátna
-        paste_x = src_x1 - ideal_x1
-        paste_y = src_y1 - ideal_y1
-        canvas.paste(cropped_img, (paste_x, paste_y))
+            buf = io.BytesIO()
+            canvas.save(buf, format="JPEG", quality=55, optimize=False)
+            cached_image_bytes = buf.getvalue()
 
-        buf = io.BytesIO()
-        canvas.save(buf, format="JPEG", quality=55, optimize=False)
-        cached_image_bytes = buf.getvalue()
         last_capture_time = now
         return cached_image_bytes
 
@@ -237,14 +235,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>RPi Remote Control</title>
     <style>
-        * {
-            box-sizing: border-box;
-            user-select: none;
-            -webkit-user-select: none;
-        }
+        * { box-sizing: border-box; user-select: none; -webkit-user-select: none; }
         html, body {
-            height: 100%;
-            height: 100dvh; /* Přesná dynamická výška mobilu bez překrytí lištou */
+            height: 100dvh;
             margin: 0;
             padding: 6px;
             background-color: #0b1120;
@@ -254,94 +247,46 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             display: flex;
             flex-direction: column;
         }
-        .header {
-            flex-shrink: 0;
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-            margin-bottom: 6px;
-        }
-        .header-top {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
+        .header { flex-shrink: 0; display: flex; flex-direction: column; gap: 6px; margin-bottom: 6px; }
+        .header-top { display: flex; justify-content: space-between; align-items: center; }
         .status-badge {
-            padding: 4px 10px;
-            border-radius: 6px;
-            font-size: 0.8rem;
-            font-weight: bold;
-            color: __STATUS_COLOR__;
-            border: 1px solid __STATUS_COLOR__;
+            padding: 4px 8px; border-radius: 6px; font-size: 0.8rem; font-weight: bold;
+            color: __STATUS_COLOR__; border: 1px solid __STATUS_COLOR__;
         }
-        .action-buttons {
-            display: flex;
-            gap: 6px;
-            width: 100%;
-        }
+        .action-buttons { display: flex; gap: 6px; width: 100%; }
         .btn-action {
-            flex: 1;
-            padding: 8px 4px;
-            border-radius: 8px;
-            font-size: 0.8rem;
-            font-weight: bold;
-            border: none;
-            cursor: pointer;
-            color: white;
-            text-align: center;
-            text-decoration: none;
+            flex: 1; padding: 8px 4px; border-radius: 8px; font-size: 0.8rem; font-weight: bold;
+            border: none; cursor: pointer; color: white; text-align: center; text-decoration: none;
         }
         .btn-on { background-color: #16a34a; }
         .btn-off { background-color: #dc2626; }
         .btn-audio { background-color: #2563eb; }
-        .btn-stream { background-color: #7c3aed; }
+        .btn-mode { background-color: #7c3aed; }
         .btn-center { background-color: #f59e0b; }
 
         #touchpad {
-            flex: 1 1 0; /* Zaručí vyplnění přesně zbylého prostoru */
+            flex: 1 1 0;
             min-height: 0;
             position: relative;
-            background-color: #0f172a;
+            background-color: #000;
             border-radius: 14px;
             border: 2px solid #334155;
             overflow: hidden;
             touch-action: none;
-            cursor: default;
-        }
-        #touchpad.active {
-            border-color: #38bdf8;
-        }
-        #screen-view {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-            position: absolute;
-            top: 0;
-            left: 0;
-            pointer-events: none;
-        }
-        .mouse-buttons {
-            flex-shrink: 0; /* ZABRÁNÍ SCHOVÁNÍ SPODNÍCH TLAČÍTEK */
             display: flex;
-            gap: 10px;
-            margin-top: 6px;
-            height: 52px;
+            align-items: center;
+            justify-content: center;
         }
+        #touchpad.active { border-color: #38bdf8; }
+        #screen-view {
+            width: 100%; height: 100%; object-fit: contain; position: absolute; top: 0; left: 0; pointer-events: none;
+        }
+        .mouse-buttons { flex-shrink: 0; display: flex; gap: 10px; margin-top: 6px; height: 52px; }
         .btn-mouse {
-            flex: 1;
-            background: #1e293b;
-            color: white;
-            border: 1px solid #475569;
-            border-radius: 12px;
-            font-size: 1rem;
-            font-weight: 600;
-            touch-action: manipulation;
-            cursor: pointer;
+            flex: 1; background: #1e293b; color: white; border: 1px solid #475569;
+            border-radius: 12px; font-size: 1rem; font-weight: 600; touch-action: manipulation; cursor: pointer;
         }
-        .btn-mouse:active {
-            background: #38bdf8;
-            color: black;
-        }
+        .btn-mouse:active { background: #38bdf8; color: black; }
     </style>
 </head>
 <body>
@@ -350,7 +295,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="status-badge">HDMI: __STATUS_TEXT__</div>
             <div style="display:flex; gap:6px;">
                 <button class="btn-action btn-center" onclick="recenterMouse()">🎯 Střed</button>
-                <button class="btn-action btn-stream" id="btn-toggle-stream" onclick="toggleStream()">👁️ Obraz</button>
+                <button class="btn-action btn-mode" id="btn-mode" onclick="toggleViewMode()">🖥️ Celá plocha</button>
             </div>
         </div>
         <div class="action-buttons">
@@ -361,7 +306,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
 
     <div id="touchpad">
-        <img id="screen-view" src="/api/screen/crop?w=360&h=480" alt="">
+        <img id="screen-view" src="/api/screen/view?w=360&h=480&mode=crop" alt="">
     </div>
 
     <div class="mouse-buttons">
@@ -372,9 +317,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <script>
         const pad = document.getElementById("touchpad");
         const screenView = document.getElementById("screen-view");
-        const btnToggleStream = document.getElementById("btn-toggle-stream");
+        const btnMode = document.getElementById("btn-mode");
 
-        let streamEnabled = true;
+        let viewMode = "crop"; // "crop" nebo "full"
         let isFetchingScreen = false;
         let fetchWatchdog = null;
         const SENSITIVITY = 1.4;
@@ -400,7 +345,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         setInterval(flushMove, 25);
 
         function updateScreen() {
-            if (!streamEnabled || isFetchingScreen) return;
+            if (isFetchingScreen) return;
             isFetchingScreen = true;
 
             clearTimeout(fetchWatchdog);
@@ -414,38 +359,47 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 screenView.src = nextImg.src;
                 isFetchingScreen = false;
             };
-            nextImg.onerror = () => {
-                isFetchingScreen = false;
-            };
-            nextImg.src = `/api/screen/crop?w=${w}&h=${h}&t=${Date.now()}`;
+            nextImg.onerror = () => { isFetchingScreen = false; };
+            nextImg.src = `/api/screen/view?w=${w}&h=${h}&mode=${viewMode}&t=${Date.now()}`;
         }
         setInterval(updateScreen, 120);
 
+        function toggleViewMode() {
+            if (viewMode === "crop") {
+                viewMode = "full";
+                btnMode.innerText = "🔍 Lupa";
+                btnMode.style.backgroundColor = "#2563eb";
+            } else {
+                viewMode = "crop";
+                btnMode.innerText = "🖥️ Celá plocha";
+                btnMode.style.backgroundColor = "#7c3aed";
+            }
+            updateScreen();
+        }
+
         function recenterMouse() {
             fetch('/api/mouse/center', { method: 'POST' })
-                .then(() => setTimeout(updateScreen, 60));
+                .then(() => setTimeout(updateScreen, 50));
         }
 
-        function toggleStream() {
-            streamEnabled = !streamEnabled;
-            if (streamEnabled) {
-                btnToggleStream.style.backgroundColor = "#7c3aed";
-                screenView.style.display = "block";
-            } else {
-                btnToggleStream.style.backgroundColor = "#475569";
-                screenView.style.display = "none";
-            }
+        // V režimu Celá plocha: klepnutí skočí přímo na dané místo
+        function handleAbsoluteTap(clientX, clientY) {
+            if (viewMode !== "full") return false;
+            const rect = pad.getBoundingClientRect();
+            const relX = (clientX - rect.left) / rect.width;
+            const relY = (clientY - rect.top) / rect.height;
+            fetch(`/api/mouse/abs?rx=${relX}&ry=${relY}`, { method: 'POST' })
+                .then(() => setTimeout(updateScreen, 50));
+            return true;
         }
 
-        // Dotykové ovládání pro mobil
+        // Dotyk
         pad.addEventListener("touchstart", (e) => {
             e.preventDefault();
             pad.classList.add("active");
             const t = e.touches[0];
-            lastX = t.clientX;
-            lastY = t.clientY;
-            startX = t.clientX;
-            startY = t.clientY;
+            lastX = t.clientX; lastY = t.clientY;
+            startX = t.clientX; startY = t.clientY;
             startTime = Date.now();
         }, { passive: false });
 
@@ -454,8 +408,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             const t = e.touches[0];
             accX += Math.round((t.clientX - lastX) * SENSITIVITY);
             accY += Math.round((t.clientY - lastY) * SENSITIVITY);
-            lastX = t.clientX;
-            lastY = t.clientY;
+            lastX = t.clientX; lastY = t.clientY;
         }, { passive: false });
 
         pad.addEventListener("touchend", (e) => {
@@ -463,19 +416,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             pad.classList.remove("active");
             const dist = Math.hypot(lastX - startX, lastY - startY);
             if (dist < 8 && (Date.now() - startTime) < 250) {
-                sendClick('left');
+                if (!handleAbsoluteTap(lastX, lastY)) {
+                    sendClick('left');
+                }
             }
             setTimeout(updateScreen, 40);
         }, { passive: false });
 
-        // Ovládání pro PC myš
+        // Myš (PC)
         pad.addEventListener("mousedown", (e) => {
             isMouseDown = true;
             pad.classList.add("active");
-            lastX = e.clientX;
-            lastY = e.clientY;
-            startX = e.clientX;
-            startY = e.clientY;
+            lastX = e.clientX; lastY = e.clientY;
+            startX = e.clientX; startY = e.clientY;
             startTime = Date.now();
         });
 
@@ -483,8 +436,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             if (!isMouseDown) return;
             accX += Math.round((e.clientX - lastX) * SENSITIVITY);
             accY += Math.round((e.clientY - lastY) * SENSITIVITY);
-            lastX = e.clientX;
-            lastY = e.clientY;
+            lastX = e.clientX; lastY = e.clientY;
         });
 
         window.addEventListener("mouseup", (e) => {
@@ -493,14 +445,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             pad.classList.remove("active");
             const dist = Math.hypot(lastX - startX, lastY - startY);
             if (dist < 8 && (Date.now() - startTime) < 250) {
-                sendClick('left');
+                if (!handleAbsoluteTap(lastX, lastY)) {
+                    sendClick('left');
+                }
             }
             setTimeout(updateScreen, 40);
         });
 
         function sendClick(btn) {
             fetch('/api/mouse/click?btn=' + btn, { method: 'POST' });
-            setTimeout(updateScreen, 80);
+            setTimeout(updateScreen, 60);
         }
 
         function triggerAudioRefresh() {
@@ -512,10 +466,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             fetch('/api/audio/refresh', { method: 'POST' })
                 .then(() => {
                     btn.innerText = "✓ Obnoveno";
-                    setTimeout(() => {
-                        btn.innerText = originalText;
-                        btn.disabled = false;
-                    }, 2000);
+                    setTimeout(() => { btn.innerText = originalText; btn.disabled = false; }, 2000);
                 });
         }
 
@@ -534,15 +485,16 @@ class ServerHandler(BaseHTTPRequestHandler):
 
         if path == "/":
             self._serve_dashboard()
-        elif path == "/api/screen/crop":
+        elif path in ["/api/screen/view", "/api/screen/crop"]:
             params = parse_qs(parsed.query)
             try:
                 w = int(params.get("w", [360])[0])
                 h = int(params.get("h", [480])[0])
             except Exception:
                 w, h = 360, 480
+            mode = params.get("mode", ["crop"])[0]
 
-            data = capture_centered_crop(w, h)
+            data = capture_screen(w, h, mode)
             if data:
                 self.send_response(200)
                 self.send_header("Content-Type", "image/jpeg")
@@ -573,7 +525,16 @@ class ServerHandler(BaseHTTPRequestHandler):
             try:
                 dx = int(params.get("dx", [0])[0])
                 dy = int(params.get("dy", [0])[0])
-                mouse.move(dx, dy)
+                mouse.move_rel(dx, dy)
+                self._send_status(204)
+            except Exception:
+                self._send_status(400)
+
+        elif path == "/api/mouse/abs":
+            try:
+                rx = float(params.get("rx", [0.5])[0])
+                ry = float(params.get("ry", [0.5])[0])
+                mouse.set_abs(int(rx * screen_width), int(ry * screen_height))
                 self._send_status(204)
             except Exception:
                 self._send_status(400)
@@ -629,7 +590,7 @@ def run_server(port):
 
     server_address = ("", port)
     httpd = ThreadingHTTPServer(server_address, ServerHandler)
-    print(f"[SERVER] Běží na portu {port} (Garantované centrování + fix spodních tlačítek)")
+    print(f"[SERVER] Běží na portu {port} (Absolutní tablet + Celá plocha / Lupa)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
