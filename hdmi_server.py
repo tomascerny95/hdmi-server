@@ -13,7 +13,7 @@ PORT = 1111
 USER = "cernytom"
 RUNTIME_DIR = "/run/user/1000"
 
-# --- ZJIŠTĚNÍ PŘESNÉHO ROZLIŠENÍ PLOCHY ---
+# --- ZJIŠTĚNÍ ROZLIŠENÍ PLOCHY ---
 def detect_desktop_resolution():
     temp = "/dev/shm/rpi_detect.png"
     try:
@@ -96,7 +96,7 @@ def get_hdmi_status() -> str:
     except Exception:
         return "neznámý"
 
-# --- OVLÁDÁNÍ MYŠI: ČISTĚ ABSOLUTNÍ UKAZATEL (BEZ DRIFTU) ---
+# --- OVLÁDÁNÍ MYŠI A KLÁVESNICE ---
 try:
     import evdev
     from evdev import UInput, ecodes as e
@@ -121,12 +121,20 @@ if HAS_EVDEV:
         'Right': e.KEY_RIGHT
     }
 
-    for ch in "abcdefghijklmnopqrstuvwxyz":
+    # Běžná písmena kromě Y a Z
+    for ch in "abcdefghijklmnopqrstuvwx":
         key_code = getattr(e, f"KEY_{ch.upper()}", None)
         if key_code:
             CHAR_KEY_MAP[ch] = (key_code, False)
             CHAR_KEY_MAP[ch.upper()] = (key_code, True)
             VALID_KEY_CODES.append(key_code)
+
+    # ⚡ FIX PRO ČESKÉ QWERTZ ROZLOŽENÍ: PROHOZENÍ Y a Z
+    CHAR_KEY_MAP['y'] = (e.KEY_Z, False)
+    CHAR_KEY_MAP['Y'] = (e.KEY_Z, True)
+    CHAR_KEY_MAP['z'] = (e.KEY_Y, False)
+    CHAR_KEY_MAP['Z'] = (e.KEY_Y, True)
+    VALID_KEY_CODES.extend([e.KEY_Y, e.KEY_Z])
 
     for i in range(10):
         key_code = getattr(e, f"KEY_{i}", None)
@@ -166,7 +174,6 @@ class AbsoluteInputController:
         self.ui = None
         if HAS_EVDEV:
             try:
-                # Absolutní ukazatel: Linux nastaví myš přímo na daný pixel
                 cap = {
                     e.EV_ABS: [
                         (e.ABS_X, evdev.AbsInfo(value=cur_x, min=0, max=screen_width - 1, fuzz=0, flat=0, resolution=1)),
@@ -178,7 +185,7 @@ class AbsoluteInputController:
                 print(f"[INPUT] Absolutní ukazatel aktivován ({screen_width}x{screen_height}).")
                 self.sync()
             except Exception as ex:
-                print(f"[INPUT] Chyba inicializace: {ex}")
+                print(f"[INPUT] Chyba inicializace evdev: {ex}")
 
     def sync(self):
         if self.ui:
@@ -212,6 +219,21 @@ class AbsoluteInputController:
             self.ui.syn()
 
     def type_text(self, text: str):
+        # 1. PŘEDNOSTNĚ: wtype (perfektní pro Wayland, podporuje háčky, čárky a neničí Y/Z)
+        cmd = [
+            "runuser", "-u", USER, "--",
+            "env", f"XDG_RUNTIME_DIR={RUNTIME_DIR}", "WAYLAND_DISPLAY=wayland-0",
+            "wtype", text
+        ] if os.getuid() == 0 else ["wtype", text]
+
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+            if res.returncode == 0:
+                return
+        except Exception:
+            pass
+
+        # 2. ZÁLOŽNĚ: evdev s opraveným QWERTZ mapováním
         if not self.ui:
             return
         for char in text:
@@ -230,7 +252,7 @@ class AbsoluteInputController:
 
 controller = AbsoluteInputController()
 
-# --- SNÍMÁNÍ OBRAZOVKY VYCENTROVANÉ NA POZICI MYŠI ---
+# --- SNÍMÁNÍ OBRAZOVKY ---
 last_capture_time = 0
 cached_image_bytes = None
 
@@ -249,7 +271,6 @@ def capture_screen(req_w, req_h):
     crop_w = max(320, min(screen_width, req_w))
     crop_h = max(240, min(screen_height, req_h))
 
-    # Ideální souřadnice pro vycentrování myši
     ideal_x1 = mx - crop_w // 2
     ideal_y1 = my - crop_h // 2
     src_x1 = max(0, ideal_x1)
@@ -276,7 +297,6 @@ def capture_screen(req_w, req_h):
             return cached_image_bytes
 
         img = Image.open(temp_raw)
-        # Plátno garantuje, že šipka je vždy přesně uprostřed i u okrajů monitoru
         canvas = Image.new("RGB", (crop_w, crop_h), (11, 17, 32))
         paste_x = src_x1 - ideal_x1
         paste_y = src_y1 - ideal_y1
@@ -548,7 +568,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             setTimeout(updateScreen, 40);
         }, { passive: false });
 
-        // PC myš
+        // Myš (PC)
         pad.addEventListener("mousedown", (e) => {
             isMouseDown = true;
             pad.classList.add("active");
@@ -718,7 +738,7 @@ def run_server(port):
 
     server_address = ("", port)
     httpd = ThreadingHTTPServer(server_address, ServerHandler)
-    print(f"[SERVER] Běží na portu {port} (Čistě absolutní myš)")
+    print(f"[SERVER] Běží na portu {port} (Absolutní myš + Podpora wtype)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
