@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""
+HDMI Controller Server
+Lightweight HTTP server for controlling HDMI output on Linux / Raspberry Pi.
+"""
+
 import argparse
 import logging
 import os
@@ -24,9 +29,29 @@ HTML_PAGE = """<!DOCTYPE html>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>HDMI Ovladač</title>
     <style>
-        body { font-family: Arial, sans-serif; text-align: center; background-color: #1e1e1e; color: #ffffff; padding-top: 50px; margin: 0; }
+        body {
+            font-family: Arial, sans-serif;
+            text-align: center;
+            background-color: #1e1e1e;
+            color: #ffffff;
+            padding-top: 50px;
+            margin: 0;
+        }
         h1 { color: #f1f1f1; }
-        .btn { display: inline-block; width: 200px; padding: 20px; margin: 15px; font-size: 18px; font-weight: bold; border: none; border-radius: 8px; cursor: pointer; transition: 0.3s; color: white; text-decoration: none; }
+        .btn {
+            display: inline-block;
+            width: 200px;
+            padding: 20px;
+            margin: 15px;
+            font-size: 18px;
+            font-weight: bold;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: 0.3s;
+            color: white;
+            text-decoration: none;
+        }
         .btn-on { background-color: #2ec4b6; }
         .btn-on:hover { background-color: #20a497; }
         .btn-off { background-color: #e71d36; }
@@ -42,6 +67,7 @@ HTML_PAGE = """<!DOCTYPE html>
 </html>
 """
 
+
 class HdmiController:
     def __init__(self, device_path: str):
         self.device_path = device_path
@@ -49,7 +75,8 @@ class HdmiController:
     def set_status(self, action: str) -> bool:
         if action not in ("on", "off"):
             return False
-        logging.info(f"HDMI status -> {action}")
+
+        logging.info(f"Nastavuji HDMI status -> {action}")
         try:
             with open(self.device_path, "w") as f:
                 f.write(f"{action}\n")
@@ -64,14 +91,16 @@ class HdmiController:
             subprocess.run(cmd, shell=True, check=True)
             return True
         except subprocess.SubprocessError as e:
-            logging.error(f"Chyba: {e}")
+            logging.error(f"Příkaz selhal: {e}")
             return False
 
+
 class HdmiRequestHandler(BaseHTTPRequestHandler):
-    controller = None
+    controller: HdmiController = None
 
     def do_GET(self):
         path = urlparse(self.path).path
+
         if path == "/":
             body = HTML_PAGE.encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -92,11 +121,12 @@ class HdmiRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         logging.info("%s - %s", self.address_string(), format % args)
 
+
 def main():
     parser = argparse.ArgumentParser(description="HDMI Web Controller")
-    parser.add_argument("--port", "-p", type=int, default=DEFAULT_PORT)
-    parser.add_argument("--device", "-d", type=str, default=DEFAULT_DEVICE)
-    parser.add_argument("--init-off", action="store_true")
+    parser.add_argument("--port", "-p", type=int, default=DEFAULT_PORT, help="Port serveru")
+    parser.add_argument("--device", "-d", type=str, default=DEFAULT_DEVICE, help="Cesta k DRM souboru")
+    parser.add_argument("--init-off", action="store_true", help="Vypnout HDMI ihned při spuštění")
     args = parser.parse_args()
 
     controller = HdmiController(args.device)
@@ -106,13 +136,14 @@ def main():
         controller.set_status("off")
 
     server = ThreadingHTTPServer(("0.0.0.0", args.port), HdmiRequestHandler)
-    logging.info(f"Běží na http://0.0.0.0:{args.port}")
+    logging.info(f"HDMI server běží na http://0.0.0.0:{args.port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
+
 
 if __name__ == "__main__":
     main()
