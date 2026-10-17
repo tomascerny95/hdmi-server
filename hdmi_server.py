@@ -13,7 +13,7 @@ PORT = 1111
 USER = "cernytom"
 RUNTIME_DIR = "/run/user/1000"
 
-# --- ZJIŠTĚNÍ ROZLIŠENÍ PLOCHY ---
+# --- ZJIŠTĚNÍ PŘESNÉHO ROZLIŠENÍ PLOCHY ---
 def detect_desktop_resolution():
     temp = "/dev/shm/rpi_detect.png"
     try:
@@ -28,6 +28,7 @@ def detect_desktop_resolution():
             img = Image.open(temp)
             w, h = img.size
             os.remove(temp)
+            print(f"[SCREEN] Zjištěno rozlišení plochy: {w}x{h}")
             return w, h
     except Exception:
         pass
@@ -95,7 +96,7 @@ def get_hdmi_status() -> str:
     except Exception:
         return "neznámý"
 
-# --- OVLÁDÁNÍ MYŠI A KLÁVESNICE (EVDEV) ---
+# --- OVLÁDÁNÍ MYŠI: ČISTĚ ABSOLUTNÍ UKAZATEL (BEZ DRIFTU) ---
 try:
     import evdev
     from evdev import UInput, ecodes as e
@@ -108,7 +109,6 @@ SPECIAL_KEY_MAP = {}
 VALID_KEY_CODES = []
 
 if HAS_EVDEV:
-    # 1. Speciální klávesy
     SPECIAL_KEY_MAP = {
         'Enter': e.KEY_ENTER,
         'Backspace': e.KEY_BACKSPACE,
@@ -121,7 +121,6 @@ if HAS_EVDEV:
         'Right': e.KEY_RIGHT
     }
 
-    # 2. Písmena a čísla
     for ch in "abcdefghijklmnopqrstuvwxyz":
         key_code = getattr(e, f"KEY_{ch.upper()}", None)
         if key_code:
@@ -135,7 +134,6 @@ if HAS_EVDEV:
             CHAR_KEY_MAP[str(i)] = (key_code, False)
             VALID_KEY_CODES.append(key_code)
 
-    # 3. Znaky
     symbols = {
         ' ': (e.KEY_SPACE, False),
         '\n': (e.KEY_ENTER, False),
@@ -163,31 +161,37 @@ if HAS_EVDEV:
     ])
     VALID_KEY_CODES = list(set(VALID_KEY_CODES))
 
-class InputController:
+class AbsoluteInputController:
     def __init__(self):
         self.ui = None
         if HAS_EVDEV:
             try:
-                # Osvědčená relativní myš + bezpečný seznam kláves
+                # Absolutní ukazatel: Linux nastaví myš přímo na daný pixel
                 cap = {
-                    e.EV_REL: [e.REL_X, e.REL_Y, e.REL_WHEEL],
+                    e.EV_ABS: [
+                        (e.ABS_X, evdev.AbsInfo(value=cur_x, min=0, max=screen_width - 1, fuzz=0, flat=0, resolution=1)),
+                        (e.ABS_Y, evdev.AbsInfo(value=cur_y, min=0, max=screen_height - 1, fuzz=0, flat=0, resolution=1))
+                    ],
                     e.EV_KEY: VALID_KEY_CODES
                 }
-                self.ui = UInput(cap, name="RPi-Web-Remote-Touchpad")
-                print("[INPUT] Ovladač myši a klávesnice úspěšně vytvořen.")
+                self.ui = UInput(cap, name="RPi-Web-Absolute-Pointer")
+                print(f"[INPUT] Absolutní ukazatel aktivován ({screen_width}x{screen_height}).")
+                self.sync()
             except Exception as ex:
-                print(f"[INPUT] Chyba inicializace evdev: {ex}")
+                print(f"[INPUT] Chyba inicializace: {ex}")
+
+    def sync(self):
+        if self.ui:
+            self.ui.write(e.EV_ABS, e.ABS_X, cur_x)
+            self.ui.write(e.EV_ABS, e.ABS_Y, cur_y)
+            self.ui.syn()
 
     def move(self, dx: int, dy: int):
         global cur_x, cur_y
         with pos_lock:
-            cur_x = max(0, min(screen_width, cur_x + dx))
-            cur_y = max(0, min(screen_height, cur_y + dy))
-
-        if self.ui:
-            self.ui.write(e.EV_REL, e.REL_X, dx)
-            self.ui.write(e.EV_REL, e.REL_Y, dy)
-            self.ui.syn()
+            cur_x = max(0, min(screen_width - 1, cur_x + dx))
+            cur_y = max(0, min(screen_height - 1, cur_y + dy))
+        self.sync()
 
     def click(self, button: str = "left"):
         if self.ui:
@@ -224,9 +228,9 @@ class InputController:
                 self.ui.syn()
                 time.sleep(0.005)
 
-controller = InputController()
+controller = AbsoluteInputController()
 
-# --- SNÍMÁNÍ OBRAZOVKY ---
+# --- SNÍMÁNÍ OBRAZOVKY VYCENTROVANÉ NA POZICI MYŠI ---
 last_capture_time = 0
 cached_image_bytes = None
 
@@ -245,6 +249,7 @@ def capture_screen(req_w, req_h):
     crop_w = max(320, min(screen_width, req_w))
     crop_h = max(240, min(screen_height, req_h))
 
+    # Ideální souřadnice pro vycentrování myši
     ideal_x1 = mx - crop_w // 2
     ideal_y1 = my - crop_h // 2
     src_x1 = max(0, ideal_x1)
@@ -271,6 +276,7 @@ def capture_screen(req_w, req_h):
             return cached_image_bytes
 
         img = Image.open(temp_raw)
+        # Plátno garantuje, že šipka je vždy přesně uprostřed i u okrajů monitoru
         canvas = Image.new("RGB", (crop_w, crop_h), (11, 17, 32))
         paste_x = src_x1 - ideal_x1
         paste_y = src_y1 - ideal_y1
@@ -542,7 +548,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             setTimeout(updateScreen, 40);
         }, { passive: false });
 
-        // Ovládání pro PC myš
+        // PC myš
         pad.addEventListener("mousedown", (e) => {
             isMouseDown = true;
             pad.classList.add("active");
@@ -712,7 +718,7 @@ def run_server(port):
 
     server_address = ("", port)
     httpd = ThreadingHTTPServer(server_address, ServerHandler)
-    print(f"[SERVER] Běží na portu {port} (Plně funkční Touchpad + Klávesnice)")
+    print(f"[SERVER] Běží na portu {port} (Čistě absolutní myš)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
