@@ -125,7 +125,7 @@ class MouseController:
 
 mouse = MouseController()
 
-# --- SNÍMÁNÍ OBRAZOVKY PŘES GRIM (WAYLAND / LABWC) ---
+# --- SNÍMÁNÍ OBRAZOVKY (GRIM NA WAYLAND-0) ---
 last_capture_time = 0
 cached_image_bytes = None
 CROP_WIDTH = 500
@@ -138,22 +138,26 @@ def capture_centered_crop():
     if cached_image_bytes and (now - last_capture_time < 0.20):
         return cached_image_bytes
 
-    temp_raw = "/dev/shm/rpi_raw_screen.jpg"
+    # Použijeme striktně příponu .jpeg a parametr -t jpeg pro grim
+    temp_raw = "/dev/shm/rpi_raw_screen.jpeg"
 
-    # Smazat starý soubor
     if os.path.exists(temp_raw):
         try:
             os.remove(temp_raw)
         except OSError:
             pass
 
-    # Spustit grim pod uživatelem cernytom s jeho Wayland relací
     if os.getuid() == 0:
-        cmd = ["runuser", "-u", USER, "--", "env", f"XDG_RUNTIME_DIR={RUNTIME_DIR}", "grim", "-q", "50", temp_raw]
+        cmd = [
+            "runuser", "-u", USER, "--",
+            "env", f"XDG_RUNTIME_DIR={RUNTIME_DIR}", "WAYLAND_DISPLAY=wayland-0",
+            "grim", "-t", "jpeg", "-q", "50", temp_raw
+        ]
     else:
         env = os.environ.copy()
         env["XDG_RUNTIME_DIR"] = RUNTIME_DIR
-        cmd = ["grim", "-q", "50", temp_raw]
+        env["WAYLAND_DISPLAY"] = "wayland-0"
+        cmd = ["grim", "-t", "jpeg", "-q", "50", temp_raw]
 
     try:
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
