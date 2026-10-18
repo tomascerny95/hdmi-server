@@ -189,13 +189,12 @@ class MouseKeyboardController:
         self.ui = None
         if HAS_EVDEV:
             try:
-                # Přidána podpora pro REL_WHEEL (kolečko myši)
                 cap = {
                     e.EV_REL: [e.REL_X, e.REL_Y, e.REL_WHEEL],
                     e.EV_KEY: VALID_KEY_CODES
                 }
                 self.ui = UInput(cap, name="RPi-Web-Remote-Mouse")
-                print("[INPUT] Virtuální myš (včetně kolečka a držení) úspěšně vytvořena!")
+                print("[INPUT] Virtuální myš a klávesnice úspěšně vytvořena!")
             except Exception as ex:
                 print(f"[CHYBA INPUTU] Nelze otevřít evdev: {ex}")
 
@@ -207,12 +206,10 @@ class MouseKeyboardController:
 
     def scroll(self, dy: int):
         if self.ui:
-            # dy > 0 nahoru, dy < 0 dolů
             self.ui.write(e.EV_REL, e.REL_WHEEL, dy)
             self.ui.syn()
 
     def button_event(self, button: str, state: int):
-        # state: 1 = stisknout (držet), 0 = pustit
         if self.ui:
             btn = e.BTN_LEFT if button == "left" else e.BTN_RIGHT
             self.ui.write(e.EV_KEY, btn, state)
@@ -317,10 +314,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             background: #0f172a; color: white; font-size: 1rem; outline: none;
         }
         .btn-kbd-key {
-            padding: 8px 14px; border-radius: 8px; border: 1px solid #475569;
-            background: #334155; color: white; font-size: 0.85rem; font-weight: bold; cursor: pointer;
+            padding: 8px 12px; border-radius: 8px; border: 1px solid #475569;
+            background: #334155; color: white; font-size: 0.9rem; font-weight: bold; cursor: pointer;
+            text-align: center;
         }
         .btn-kbd-key:active { background: #38bdf8; color: black; }
+        .btn-arrow { font-size: 1.1rem; flex: 1; }
 
         /* TOUCHPAD PLOCHA */
         #touchpad {
@@ -378,16 +377,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <button class="btn-action btn-audio" id="btn-audio" onclick="triggerAudioRefresh()">🔊 Zvuk</button>
         </div>
 
+        <!-- PANEL KLÁVESNICE -->
         <div id="keyboard-panel">
             <form onsubmit="submitText(event)" class="kbd-row">
                 <input type="text" id="kbd-input" placeholder="Zde pište text do Raspberry..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
                 <button type="submit" class="btn-kbd-key" style="background:#0ea5e9;">Odeslat</button>
             </form>
+
+            <!-- Řádek 1: Běžné klávesy -->
             <div class="kbd-row">
-                <button class="btn-kbd-key" style="flex:1;" onclick="sendKey('Enter')">↵ Enter</button>
-                <button class="btn-kbd-key" style="flex:1;" onclick="sendKey('Backspace')">⌫ Smazat</button>
-                <button class="btn-kbd-key" style="flex:1;" onclick="sendKey('Tab')">Tab</button>
                 <button class="btn-kbd-key" style="flex:1;" onclick="sendKey('Esc')">Esc</button>
+                <button class="btn-kbd-key" style="flex:1;" onclick="sendKey('Tab')">Tab</button>
+                <button class="btn-kbd-key" style="flex:1.2;" onclick="sendKey('Backspace')">⌫ Smazat</button>
+                <button class="btn-kbd-key" style="flex:1.4; background:#16a34a;" onclick="sendKey('Enter')">↵ Enter</button>
+            </div>
+
+            <!-- Řádek 2: Mezerník + Šipky -->
+            <div class="kbd-row">
+                <button class="btn-kbd-key" style="flex:2.5;" onclick="sendKey('Space')">␣ Mezerník</button>
+                <button class="btn-kbd-key btn-arrow" onclick="sendKey('Left')">←</button>
+                <button class="btn-kbd-key btn-arrow" onclick="sendKey('Up')">↑</button>
+                <button class="btn-kbd-key btn-arrow" onclick="sendKey('Down')">↓</button>
+                <button class="btn-kbd-key btn-arrow" onclick="sendKey('Right')">→</button>
             </div>
         </div>
     </div>
@@ -508,7 +519,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             startX = t.clientX; startY = t.clientY;
             const now = Date.now();
 
-            // Detekce dvojitého klepnutí a držení (pro přichycení okna)
             if (now - lastTapTime < 280) {
                 isDragging = true;
                 pad.classList.add("dragging");
@@ -522,18 +532,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         pad.addEventListener("touchmove", (e) => {
             e.preventDefault();
 
-            // 2 PRSTY = KOLEČKO MYŠI
+            // 2 PRSTY = KOLEČKO
             if (e.touches.length === 2) {
                 const currentY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
                 const diff = currentY - lastTwoY;
                 lastTwoY = currentY;
-                accScroll += diff; // táhnutí nahoru/dolů
+                accScroll += diff;
                 return;
             }
 
             if (isTwoFinger) return;
 
-            // 1 PRST = POHYB (NEBO TAŽENÍ PŘICHYCENÉHO OKNA)
+            // 1 PRST = POHYB / TAŽENÍ
             const t = e.touches[0];
             accX += Math.round((t.clientX - lastX) * SENSITIVITY);
             accY += Math.round((t.clientY - lastY) * SENSITIVITY);
@@ -550,7 +560,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
             pad.classList.remove("active");
 
-            // Konec přichycení
             if (isDragging) {
                 isDragging = false;
                 pad.classList.remove("dragging");
@@ -559,7 +568,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 return;
             }
 
-            // Běžné klepnutí (klik)
             const dist = Math.hypot(lastX - startX, lastY - startY);
             const now = Date.now();
             if (dist < 10 && (now - startTime) < 250) {
@@ -581,7 +589,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         function setupHoldButton(btnId, buttonName) {
             const btn = document.getElementById(btnId);
 
-            // Mobil
             btn.addEventListener("touchstart", (e) => {
                 e.preventDefault();
                 btn.classList.add("held");
@@ -594,7 +601,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 fetch(`/api/mouse/press?btn=${buttonName}&state=0`, { method: 'POST' });
             }, { passive: false });
 
-            // PC myš
             btn.addEventListener("mousedown", (e) => {
                 btn.classList.add("held");
                 fetch(`/api/mouse/press?btn=${buttonName}&state=1`, { method: 'POST' });
@@ -695,7 +701,7 @@ class ServerHandler(BaseHTTPRequestHandler):
             controller.click(btn)
             self._send_status(204)
 
-        # 5. Klávesnice
+        # 5. Klávesnice (včetně šipek a mezerníku)
         elif path == "/api/keyboard/key":
             key_name = params.get("key", [""])[0]
             if key_name:
@@ -747,7 +753,7 @@ class ServerHandler(BaseHTTPRequestHandler):
         self.wfile.write(html.encode("utf-8"))
 
     def log_message(self, format, *args):
-        # Filtruje časté logy pohybu a kolečka, ať nezaplavují terminál
+        # Filtruje logy pohybu a kolečka
         if len(args) > 0 and any(k in str(args[0]) for k in ["api/mouse/move", "api/mouse/wheel"]):
             return
         print(f"[HTTP] {self.address_string()} - {format % args}")
