@@ -90,7 +90,6 @@ def delayed_audio_refresh():
 
 def delayed_screen_refresh():
     time.sleep(5.0)
-    update_desktop_resolution()
     controller.center()
 
 # --- OVLÁDÁNÍ HDMI ---
@@ -199,30 +198,24 @@ class AbsoluteInputController:
         self.ui = None
         if HAS_EVDEV:
             try:
-                # Rozsah 0..65535 je standard pro absolutní tabletová zařízení ve Waylandu.
-                # Vytvoří se POUZE JEDNOU a zůstává trvale aktivní.
+                # Rozsah přesně odpovídá pixelům plochy – resolution=1 unit/pixel pro 1:1 mapování
                 cap = {
                     e.EV_ABS: [
-                        (e.ABS_X, evdev.AbsInfo(value=32767, min=0, max=65535, fuzz=0, flat=0, resolution=1)),
-                        (e.EV_ABS, evdev.AbsInfo(value=32767, min=0, max=65535, fuzz=0, flat=0, resolution=1))
+                        (e.ABS_X, evdev.AbsInfo(value=cur_x, min=0, max=screen_width - 1, fuzz=0, flat=0, resolution=1)),
+                        (e.EV_ABS, evdev.AbsInfo(value=cur_y, min=0, max=screen_height - 1, fuzz=0, flat=0, resolution=1))
                     ],
                     e.EV_KEY: VALID_KEY_CODES
                 }
                 self.ui = UInput(cap, name="RPi-Web-Absolute-Pointer")
-                print("[INPUT] Absolutní ukazatel trvale aktivován (rozsah 0..65535).")
+                print(f"[INPUT] Absolutní ukazatel aktivován ({screen_width}x{screen_height}).")
                 self.sync()
             except Exception as ex:
                 print(f"[INPUT] Chyba inicializace evdev: {ex}")
 
     def sync(self):
         if self.ui:
-            max_w = max(1, screen_width - 1)
-            max_h = max(1, screen_height - 1)
-            # Přepočet pixelů obrazovky na normalizovaný rozsah 0..65535 pro Wayland
-            abs_x = int(max(0, min(max_w, cur_x)) / max_w * 65535)
-            abs_y = int(max(0, min(max_h, cur_y)) / max_h * 65535)
-            self.ui.write(e.EV_ABS, e.ABS_X, abs_x)
-            self.ui.write(e.EV_ABS, e.ABS_Y, abs_y)
+            self.ui.write(e.EV_ABS, e.ABS_X, cur_x)
+            self.ui.write(e.EV_ABS, e.ABS_Y, cur_y)
             self.ui.syn()
 
     def move(self, dx: int, dy: int):
@@ -238,7 +231,7 @@ class AbsoluteInputController:
             cur_x = screen_width // 2
             cur_y = screen_height // 2
         self.sync()
-        print(f"[INPUT] Myš vycentrována na střed: {cur_x}, {cur_y}")
+        print(f"[INPUT] Myš vycentrována na: {cur_x}, {cur_y}")
 
     def click(self, button: str = "left"):
         if self.ui:
@@ -289,20 +282,6 @@ class AbsoluteInputController:
                 time.sleep(0.005)
 
 controller = AbsoluteInputController()
-
-def update_desktop_resolution():
-    global screen_width, screen_height, cur_x, cur_y
-    w, h = detect_desktop_resolution()
-    if w > 0 and h > 0 and (w != screen_width or h != screen_height):
-        print(f"[SCREEN] Aktualizace rozlišení: {screen_width}x{screen_height} -> {w}x{h}")
-        with pos_lock:
-            # Poměrný přepočet pozice myši do nového rozlišení
-            cur_x = int((cur_x / max(1, screen_width - 1)) * (w - 1))
-            cur_y = int((cur_y / max(1, screen_height - 1)) * (h - 1))
-            screen_width = w
-            screen_height = h
-        controller.sync()
-    return screen_width, screen_height
 
 # --- SNÍMÁNÍ OBRAZOVKY ---
 last_capture_time = 0
@@ -599,7 +578,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        // Dotykové ovládání (mobil)
+        // Dotykové ovládání: tažení = posun touchpadu, krátké klepnutí = přímý skok na prvek a klik
         pad.addEventListener("touchstart", (e) => {
             e.preventDefault();
             pad.classList.add("active");
@@ -621,13 +600,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             e.preventDefault();
             pad.classList.remove("active");
             const dist = Math.hypot(lastX - startX, lastY - startY);
-            if (dist < 8 && (Date.now() - startTime) < 250) {
-                sendClick('left');
+            
+            // Krátké ťuknutí na konkrétní místo: skočí přímo tam a klikne
+            if (dist < 10 && (Date.now() - startTime) < 300) {
+                const rect = pad.getBoundingClientRect();
+                const tapX = startX - rect.left;
+                const tapY = startY - rect.top;
+                const offsetX = Math.round(tapX - rect.width / 2);
+                const offsetY = Math.round(tapY - rect.height / 2);
+                fetch('/api/mouse/click_at?dx=' + offsetX + '&dy=' + offsetY + '&btn=left', { method: 'POST' })
+                    .then(() => setTimeout(updateScreen, 60));
+            } else {
+                setTimeout(updateScreen, 40);
             }
-            setTimeout(updateScreen, 40);
         }, { passive: false });
 
-        // Myš (PC)
+        // Myš (pro testování na PC)
         pad.addEventListener("mousedown", (e) => {
             isMouseDown = true;
             pad.classList.add("active");
@@ -649,9 +637,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             pad.classList.remove("active");
             const dist = Math.hypot(lastX - startX, lastY - startY);
             if (dist < 8 && (Date.now() - startTime) < 250) {
-                sendClick('left');
+                const rect = pad.getBoundingClientRect();
+                const tapX = startX - rect.left;
+                const tapY = startY - rect.top;
+                const offsetX = Math.round(tapX - rect.width / 2);
+                const offsetY = Math.round(tapY - rect.height / 2);
+                fetch('/api/mouse/click_at?dx=' + offsetX + '&dy=' + offsetY + '&btn=left', { method: 'POST' })
+                    .then(() => setTimeout(updateScreen, 60));
+            } else {
+                setTimeout(updateScreen, 40);
             }
-            setTimeout(updateScreen, 40);
         });
 
         function sendClick(btn) {
@@ -735,8 +730,19 @@ class ServerHandler(BaseHTTPRequestHandler):
             except Exception:
                 self._send_status(400)
 
+        elif path == "/api/mouse/click_at":
+            try:
+                dx = int(params.get("dx", [0])[0])
+                dy = int(params.get("dy", [0])[0])
+                btn = params.get("btn", ["left"])[0]
+                controller.move(dx, dy)
+                time.sleep(0.01)
+                controller.click(btn)
+                self._send_status(204)
+            except Exception:
+                self._send_status(400)
+
         elif path == "/api/mouse/center":
-            update_desktop_resolution()
             controller.center()
             self._send_status(204)
 
