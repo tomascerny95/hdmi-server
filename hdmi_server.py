@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import os
-import io
 import time
 import argparse
 import threading
@@ -13,7 +12,7 @@ PORT = 1111
 USER = "cernytom"
 RUNTIME_DIR = "/run/user/1000"
 
-# --- ZJIŠTĚNÍ ROZLIŠENÍ PLOCHY ---
+# --- ZJIŠTĚNÍ ROZLIŠENÍ PLOCHY (pouze jednou při startu) ---
 def detect_desktop_resolution():
     temp = "/dev/shm/rpi_detect.png"
     try:
@@ -28,7 +27,7 @@ def detect_desktop_resolution():
             img = Image.open(temp)
             w, h = img.size
             os.remove(temp)
-            print(f"[SCREEN] Zjištěno rozlišení plochy: {w}x{h}")
+            print(f"[SCREEN] Rozlišení plochy: {w}x{h}")
             return w, h
     except Exception:
         pass
@@ -39,7 +38,7 @@ cur_x = screen_width // 2
 cur_y = screen_height // 2
 pos_lock = threading.Lock()
 
-# --- OVLÁDÁNÍ ZVUKU ---
+# --- SPOLEHLIVÉ OVLÁDÁNÍ ZVUKU (neodstřeluje lištu a drží VLC) ---
 def refresh_audio():
     for cmd in ["udevadm trigger --subsystem-match=sound", "alsactl restore"]:
         try:
@@ -47,6 +46,7 @@ def refresh_audio():
         except Exception:
             pass
 
+    # Šetrný restart WirePlumberu přes systemd
     try:
         cmd_wp = f"runuser -u {USER} -- env XDG_RUNTIME_DIR={RUNTIME_DIR} systemctl --user restart wireplumber"
         subprocess.run(cmd_wp, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -69,8 +69,10 @@ def refresh_audio():
                     break
 
         if hdmi_sink:
+            # Nastavit HDMI jako výchozí výstup
             subprocess.run(f"{env_prefix} pactl set-default-sink {hdmi_sink}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
+            # PŘESUN BĚŽÍCÍCH STREAMŮ (VLC nepřestane hrát):
             cmd_inputs = f"{env_prefix} pactl list sink-inputs short"
             res_inputs = subprocess.run(cmd_inputs, shell=True, capture_output=True, text=True)
             for line in res_inputs.stdout.strip().splitlines():
@@ -79,10 +81,8 @@ def refresh_audio():
                     input_id = parts[0]
                     subprocess.run(f"{env_prefix} pactl move-sink-input {input_id} {hdmi_sink}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             print(f"[AUDIO] Úspěšně přepnuto na HDMI: {hdmi_sink}")
-        else:
-            print("[AUDIO] HDMI sink nebyl detekován.")
     except Exception as ex:
-        print(f"[AUDIO] Chyba při obnově audia: {ex}")
+        print(f"[AUDIO] Chyba při obnově: {ex}")
 
 def delayed_audio_refresh():
     time.sleep(5.0)
@@ -117,7 +117,7 @@ def get_hdmi_status() -> str:
     except Exception:
         return "neznámý"
 
-# --- OVLÁDÁNÍ MYŠI A KLÁVESNICE (PŮVODNÍ FUNKČNÍ ŘEŠENÍ) ---
+# --- OVLÁDÁNÍ MYŠI A KLÁVESNICE (přesně podle vašeho vzoru) ---
 try:
     import evdev
     from evdev import UInput, ecodes as e
@@ -149,6 +149,7 @@ if HAS_EVDEV:
             CHAR_KEY_MAP[ch.upper()] = (key_code, True)
             VALID_KEY_CODES.append(key_code)
 
+    # FIX PRO ČESKÉ QWERTZ
     CHAR_KEY_MAP['y'] = (e.KEY_Z, False)
     CHAR_KEY_MAP['Y'] = (e.KEY_Z, True)
     CHAR_KEY_MAP['z'] = (e.KEY_Y, False)
@@ -219,13 +220,6 @@ class AbsoluteInputController:
             cur_y = max(0, min(screen_height - 1, cur_y + dy))
         self.sync()
 
-    def center(self):
-        global cur_x, cur_y
-        with pos_lock:
-            cur_x = screen_width // 2
-            cur_y = screen_height // 2
-        self.sync()
-
     def click(self, button: str = "left"):
         if self.ui:
             btn = e.BTN_LEFT if button == "left" else e.BTN_RIGHT
@@ -245,6 +239,7 @@ class AbsoluteInputController:
             self.ui.syn()
 
     def type_text(self, text: str):
+        # 1. PŘEDNOSTNĚ: wtype
         cmd = [
             "runuser", "-u", USER, "--",
             "env", f"XDG_RUNTIME_DIR={RUNTIME_DIR}", "WAYLAND_DISPLAY=wayland-0",
@@ -258,6 +253,7 @@ class AbsoluteInputController:
         except Exception:
             pass
 
+        # 2. ZÁLOŽNĚ: evdev
         if not self.ui:
             return
         for char in text:
@@ -276,78 +272,19 @@ class AbsoluteInputController:
 
 controller = AbsoluteInputController()
 
-# --- SNÍMÁNÍ OBRAZOVKY ---
-last_capture_time = 0
-cached_image_bytes = None
-
-def capture_screen(req_w, req_h):
-    global last_capture_time, cached_image_bytes
-
-    now = time.time()
-    if cached_image_bytes and (now - last_capture_time < 0.05):
-        return cached_image_bytes
-
-    temp_raw = "/dev/shm/rpi_crop.png"
-
-    with pos_lock:
-        mx, my = cur_x, cur_y
-
-    crop_w = max(320, min(screen_width, req_w))
-    crop_h = max(240, min(screen_height, req_h))
-
-    ideal_x1 = mx - crop_w // 2
-    ideal_y1 = my - crop_h // 2
-    src_x1 = max(0, ideal_x1)
-    src_y1 = max(0, ideal_y1)
-    src_x2 = min(screen_width, ideal_x1 + crop_w)
-    src_y2 = min(screen_height, ideal_y1 + crop_h)
-
-    grab_w = src_x2 - src_x1
-    grab_h = src_y2 - src_y1
-    if grab_w <= 0 or grab_h <= 0:
-        return cached_image_bytes
-
-    geom = f"{src_x1},{src_y1} {grab_w}x{grab_h}"
-
-    cmd = [
-        "runuser", "-u", USER, "--",
-        "env", f"XDG_RUNTIME_DIR={RUNTIME_DIR}", "WAYLAND_DISPLAY=wayland-0",
-        "grim", "-c", "-g", geom, temp_raw
-    ] if os.getuid() == 0 else ["grim", "-c", "-g", geom, temp_raw]
-
-    try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1)
-        if not os.path.exists(temp_raw):
-            return cached_image_bytes
-
-        img = Image.open(temp_raw)
-        canvas = Image.new("RGB", (crop_w, crop_h), (11, 17, 32))
-        paste_x = src_x1 - ideal_x1
-        paste_y = src_y1 - ideal_y1
-        canvas.paste(img, (paste_x, paste_y))
-
-        buf = io.BytesIO()
-        canvas.save(buf, format="JPEG", quality=55, optimize=False)
-        cached_image_bytes = buf.getvalue()
-        last_capture_time = now
-        return cached_image_bytes
-
-    except Exception:
-        return cached_image_bytes
-
-# --- HTML ŠABLONA ---
+# --- HTML ŠABLONA PRO MOBILNÍ TOUCHPAD ---
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="cs">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <title>RPi Remote Control</title>
+    <title>RPi Remote Touchpad</title>
     <style>
         * { box-sizing: border-box; user-select: none; -webkit-user-select: none; }
         html, body {
             height: 100dvh;
             margin: 0;
-            padding: 6px;
+            padding: 8px;
             background-color: #0b1120;
             color: #f8fafc;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -355,24 +292,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             display: flex;
             flex-direction: column;
         }
-        .header { flex-shrink: 0; display: flex; flex-direction: column; gap: 6px; margin-bottom: 6px; }
+        .header { flex-shrink: 0; display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
         .header-top { display: flex; justify-content: space-between; align-items: center; }
         .status-badge {
-            padding: 4px 8px; border-radius: 6px; font-size: 0.8rem; font-weight: bold;
+            padding: 6px 10px; border-radius: 8px; font-size: 0.85rem; font-weight: bold;
             color: __STATUS_COLOR__; border: 1px solid __STATUS_COLOR__;
         }
-        .top-tools { display: flex; gap: 6px; }
-        .action-buttons { display: flex; gap: 6px; width: 100%; }
+        .top-tools { display: flex; gap: 8px; }
+        .action-buttons { display: flex; gap: 8px; width: 100%; }
         .btn-action {
-            flex: 1; padding: 8px 4px; border-radius: 8px; font-size: 0.8rem; font-weight: bold;
+            flex: 1; padding: 10px 6px; border-radius: 8px; font-size: 0.85rem; font-weight: bold;
             border: none; cursor: pointer; color: white; text-align: center; text-decoration: none;
         }
         .btn-on { background-color: #16a34a; }
         .btn-off { background-color: #dc2626; }
         .btn-audio { background-color: #2563eb; }
-        .btn-center { background-color: #d97706; }
         .btn-kbd { background-color: #0ea5e9; }
-        .btn-stream { background-color: #7c3aed; }
         .btn-close { background-color: #991b1b; }
 
         #keyboard-panel {
@@ -380,41 +315,55 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             background: #1e293b;
             padding: 8px;
             border-radius: 10px;
-            margin-bottom: 6px;
             flex-direction: column;
-            gap: 6px;
+            gap: 8px;
             border: 1px solid #334155;
         }
-        .kbd-row { display: flex; gap: 6px; }
+        .kbd-row { display: flex; gap: 8px; }
         #kbd-input {
-            flex: 1; padding: 8px 12px; border-radius: 8px; border: 1px solid #475569;
+            flex: 1; padding: 10px 14px; border-radius: 8px; border: 1px solid #475569;
             background: #0f172a; color: white; font-size: 1rem; outline: none;
         }
         .btn-kbd-key {
-            padding: 6px 12px; border-radius: 8px; border: 1px solid #475569;
+            padding: 8px 14px; border-radius: 8px; border: 1px solid #475569;
             background: #334155; color: white; font-size: 0.85rem; font-weight: bold; cursor: pointer;
         }
         .btn-kbd-key:active { background: #38bdf8; color: black; }
 
+        /* TOUCHPAD PLOCHA */
         #touchpad {
             flex: 1 1 0;
             min-height: 0;
             position: relative;
-            background-color: #000;
-            border-radius: 14px;
+            background: radial-gradient(circle, #1e293b 0%, #0f172a 100%);
+            border-radius: 16px;
             border: 2px solid #334155;
-            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
             touch-action: none;
             cursor: crosshair;
         }
-        #touchpad.active { border-color: #38bdf8; }
-        #screen-view {
-            width: 100%; height: 100%; object-fit: contain; position: absolute; top: 0; left: 0; pointer-events: none;
+        #touchpad.active {
+            border-color: #38bdf8;
+            background: radial-gradient(circle, #253349 0%, #111a2e 100%);
         }
-        .mouse-buttons { flex-shrink: 0; display: flex; gap: 10px; margin-top: 6px; height: 52px; }
+        .touchpad-label {
+            color: #64748b;
+            font-size: 1.1rem;
+            font-weight: 500;
+            letter-spacing: 1px;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .mouse-buttons { flex-shrink: 0; display: flex; gap: 12px; margin-top: 8px; height: 56px; }
         .btn-mouse {
             flex: 1; background: #1e293b; color: white; border: 1px solid #475569;
-            border-radius: 12px; font-size: 1rem; font-weight: 600; touch-action: manipulation; cursor: pointer;
+            border-radius: 14px; font-size: 1.05rem; font-weight: 600; touch-action: manipulation; cursor: pointer;
         }
         .btn-mouse:active { background: #38bdf8; color: black; }
     </style>
@@ -425,15 +374,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="status-badge">HDMI: __STATUS_TEXT__</div>
             <div class="top-tools">
                 <button class="btn-action btn-kbd" onclick="toggleKeyboard()">⌨️ Klávesnice</button>
-                <button class="btn-action btn-stream" id="btn-stream" onclick="toggleStream()">👁️ Obraz: ZAP</button>
                 <button class="btn-action btn-close" onclick="closeApp()">❌ Zavřít</button>
             </div>
         </div>
         <div class="action-buttons">
-            <a href="/hdmi/on" class="btn-action btn-on">Zapnout</a>
-            <a href="/hdmi/off" class="btn-action btn-off">Vypnout</a>
+            <a href="/hdmi/on" class="btn-action btn-on">Zapnout TV</a>
+            <a href="/hdmi/off" class="btn-action btn-off">Vypnout TV</a>
             <button class="btn-action btn-audio" id="btn-audio" onclick="triggerAudioRefresh()">🔊 Zvuk</button>
-            <button class="btn-action btn-center" onclick="centerMouse()">🎯 Střed</button>
         </div>
 
         <div id="keyboard-panel">
@@ -450,27 +397,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
     </div>
 
+    <!-- TOUCHPAD -->
     <div id="touchpad">
-        <img id="screen-view" src="/api/screen/crop?w=360&h=480" alt="">
+        <div class="touchpad-label">
+            <span style="font-size:2rem;">🖱️</span>
+            <span>Dotyková plocha</span>
+        </div>
     </div>
 
     <div class="mouse-buttons">
-        <button class="btn-mouse" id="btn-left">Levé tl.</button>
-        <button class="btn-mouse" id="btn-right">Pravé tl.</button>
+        <button class="btn-mouse" id="btn-left">Levé tlačítko</button>
+        <button class="btn-mouse" id="btn-right">Pravé tlačítko</button>
     </div>
 
     <script>
         const pad = document.getElementById("touchpad");
-        const screenView = document.getElementById("screen-view");
-        const btnStream = document.getElementById("btn-stream");
         const kbdPanel = document.getElementById("keyboard-panel");
         const kbdInput = document.getElementById("kbd-input");
 
-        let streamEnabled = true;
-        let isFetchingScreen = false;
-        let fetchWatchdog = null;
         const SENSITIVITY = 1.4;
-
         let lastX = 0, lastY = 0;
         let startX = 0, startY = 0;
         let startTime = 0;
@@ -489,32 +434,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     .finally(() => { isSending = false; });
             }
         }
-        setInterval(flushMove, 25);
-
-        function updateScreen() {
-            if (!streamEnabled || isFetchingScreen) return;
-            isFetchingScreen = true;
-
-            clearTimeout(fetchWatchdog);
-            fetchWatchdog = setTimeout(() => { isFetchingScreen = false; }, 800);
-
-            const w = Math.round(pad.clientWidth) || 360;
-            const h = Math.round(pad.clientHeight) || 480;
-
-            const nextImg = new Image();
-            nextImg.onload = () => {
-                screenView.src = nextImg.src;
-                isFetchingScreen = false;
-            };
-            nextImg.onerror = () => { isFetchingScreen = false; };
-            nextImg.src = `/api/screen/crop?w=${w}&h=${h}&t=${Date.now()}`;
-        }
-        setInterval(updateScreen, 120);
-
-        function centerMouse() {
-            fetch('/api/mouse/center', { method: 'POST' })
-                .then(() => setTimeout(updateScreen, 50));
-        }
+        setInterval(flushMove, 20);
 
         function toggleKeyboard() {
             if (kbdPanel.style.display === "flex") {
@@ -537,26 +457,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 });
                 kbdInput.value = "";
             }
-            setTimeout(updateScreen, 80);
         }
 
         function sendKey(keyName) {
             fetch('/api/keyboard/key?key=' + keyName, { method: 'POST' });
-            setTimeout(updateScreen, 80);
-        }
-
-        function toggleStream() {
-            streamEnabled = !streamEnabled;
-            if (streamEnabled) {
-                btnStream.innerText = "👁️ Obraz: ZAP";
-                btnStream.style.backgroundColor = "#7c3aed";
-                screenView.style.display = "block";
-                updateScreen();
-            } else {
-                btnStream.innerText = "👁️ Obraz: VYP";
-                btnStream.style.backgroundColor = "#475569";
-                screenView.style.display = "none";
-            }
         }
 
         function closeApp() {
@@ -566,7 +470,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 document.body.innerHTML = `
                     <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100dvh;color:#94a3b8;font-size:1.2rem;text-align:center;padding:20px;">
                         <span>Aplikace byla ukončena.</span>
-                        <span style="font-size:0.9rem;margin-top:10px;color:#64748b;">Nyní můžete zavřít tuto záložku v prohlížeči.</span>
+                        <span style="font-size:0.9rem;margin-top:10px;color:#64748b;">Můžete zavřít tuto záložku.</span>
                     </div>`;
             }
         }
@@ -593,13 +497,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             e.preventDefault();
             pad.classList.remove("active");
             const dist = Math.hypot(lastX - startX, lastY - startY);
+            // Klepnutí kratší než 250 ms bez posunu = kliknutí
             if (dist < 8 && (Date.now() - startTime) < 250) {
                 sendClick('left');
             }
-            setTimeout(updateScreen, 40);
         }, { passive: false });
 
-        // Myš (PC)
+        // Myš (testování z PC)
         pad.addEventListener("mousedown", (e) => {
             isMouseDown = true;
             pad.classList.add("active");
@@ -623,23 +527,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             if (dist < 8 && (Date.now() - startTime) < 250) {
                 sendClick('left');
             }
-            setTimeout(updateScreen, 40);
         });
 
         function sendClick(btn) {
             fetch('/api/mouse/click?btn=' + btn, { method: 'POST' });
-            setTimeout(updateScreen, 60);
         }
 
         function triggerAudioRefresh() {
             const btn = document.getElementById("btn-audio");
             const originalText = btn.innerText;
-            btn.innerText = "⏳ Načítám...";
+            btn.innerText = "⏳ Obnovuji...";
             btn.disabled = true;
 
             fetch('/api/audio/refresh', { method: 'POST' })
                 .then(() => {
-                    btn.innerText = "✓ Obnoveno";
+                    btn.innerText = "✓ Zvuk OK";
                     setTimeout(() => { btn.innerText = originalText; btn.disabled = false; }, 2000);
                 })
                 .catch(() => {
@@ -663,24 +565,6 @@ class ServerHandler(BaseHTTPRequestHandler):
 
         if path == "/":
             self._serve_dashboard()
-        elif path in ["/api/screen/crop", "/api/screen/view"]:
-            params = parse_qs(parsed.query)
-            try:
-                w = int(params.get("w", [360])[0])
-                h = int(params.get("h", [480])[0])
-            except Exception:
-                w, h = 360, 480
-
-            data = capture_screen(w, h)
-            if data:
-                self.send_response(200)
-                self.send_header("Content-Type", "image/jpeg")
-                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-            else:
-                self.send_error(503)
         elif path == "/hdmi/on":
             set_hdmi(True)
             self._redirect_home()
@@ -706,10 +590,6 @@ class ServerHandler(BaseHTTPRequestHandler):
                 self._send_status(204)
             except Exception:
                 self._send_status(400)
-
-        elif path == "/api/mouse/center":
-            controller.center()
-            self._send_status(204)
 
         elif path == "/api/mouse/click":
             btn = params.get("btn", ["left"])[0]
@@ -767,7 +647,8 @@ class ServerHandler(BaseHTTPRequestHandler):
         self.wfile.write(html.encode("utf-8"))
 
     def log_message(self, format, *args):
-        if len(args) > 0 and any(k in str(args[0]) for k in ["api/mouse", "api/screen"]):
+        # Filtruje logy pohybu myši, ať nezaplavují terminál
+        if len(args) > 0 and "api/mouse" in str(args[0]):
             return
         print(f"[HTTP] {self.address_string()} - {format % args}")
 
@@ -777,7 +658,7 @@ def run_server(port):
 
     server_address = ("", port)
     httpd = ThreadingHTTPServer(server_address, ServerHandler)
-    print(f"[SERVER] Běží na portu {port} (Absolutní myš + Podpora wtype)")
+    print(f"[SERVER] Běží na portu {port} (Touchpad + Klávesnice + Zvuk)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
