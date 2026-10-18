@@ -84,12 +84,10 @@ def refresh_audio():
     except Exception as ex:
         print(f"[AUDIO] Chyba při obnově audia: {ex}")
 
-# ZVUK: čeká 5 sekund
 def delayed_audio_refresh():
     time.sleep(5.0)
     refresh_audio()
 
-# OBRAZ A MYŠ: čeká 5 sekund
 def delayed_screen_refresh():
     time.sleep(5.0)
     update_desktop_resolution()
@@ -112,7 +110,6 @@ def set_hdmi(enable: bool) -> bool:
         with open(HDMI_STATUS_PATH, "w") as f:
             f.write(state_str + "\n")
         if enable:
-            # Obě akce se spustí se zpožděním 5 sekund
             threading.Thread(target=delayed_screen_refresh, daemon=True).start()
             threading.Thread(target=delayed_audio_refresh, daemon=True).start()
         return True
@@ -201,35 +198,31 @@ class AbsoluteInputController:
     def __init__(self):
         self.ui = None
         if HAS_EVDEV:
-            self.reinit(screen_width, screen_height)
-
-    def reinit(self, w, h):
-        if not HAS_EVDEV:
-            return
-        if self.ui:
             try:
-                self.ui.close()
-            except Exception:
-                pass
-            self.ui = None
-        try:
-            cap = {
-                e.EV_ABS: [
-                    (e.ABS_X, evdev.AbsInfo(value=cur_x, min=0, max=w - 1, fuzz=0, flat=0, resolution=1)),
-                    (e.EV_ABS, evdev.AbsInfo(value=cur_y, min=0, max=h - 1, fuzz=0, flat=0, resolution=1))
-                ],
-                e.EV_KEY: VALID_KEY_CODES
-            }
-            self.ui = UInput(cap, name="RPi-Web-Absolute-Pointer")
-            print(f"[INPUT] Absolutní ukazatel inicializován na {w}x{h}.")
-            self.sync()
-        except Exception as ex:
-            print(f"[INPUT] Chyba inicializace evdev: {ex}")
+                # Rozsah 0..65535 je standard pro absolutní tabletová zařízení ve Waylandu.
+                # Vytvoří se POUZE JEDNOU a zůstává trvale aktivní.
+                cap = {
+                    e.EV_ABS: [
+                        (e.ABS_X, evdev.AbsInfo(value=32767, min=0, max=65535, fuzz=0, flat=0, resolution=1)),
+                        (e.EV_ABS, evdev.AbsInfo(value=32767, min=0, max=65535, fuzz=0, flat=0, resolution=1))
+                    ],
+                    e.EV_KEY: VALID_KEY_CODES
+                }
+                self.ui = UInput(cap, name="RPi-Web-Absolute-Pointer")
+                print("[INPUT] Absolutní ukazatel trvale aktivován (rozsah 0..65535).")
+                self.sync()
+            except Exception as ex:
+                print(f"[INPUT] Chyba inicializace evdev: {ex}")
 
     def sync(self):
         if self.ui:
-            self.ui.write(e.EV_ABS, e.ABS_X, cur_x)
-            self.ui.write(e.EV_ABS, e.ABS_Y, cur_y)
+            max_w = max(1, screen_width - 1)
+            max_h = max(1, screen_height - 1)
+            # Přepočet pixelů obrazovky na normalizovaný rozsah 0..65535 pro Wayland
+            abs_x = int(max(0, min(max_w, cur_x)) / max_w * 65535)
+            abs_y = int(max(0, min(max_h, cur_y)) / max_h * 65535)
+            self.ui.write(e.EV_ABS, e.ABS_X, abs_x)
+            self.ui.write(e.EV_ABS, e.ABS_Y, abs_y)
             self.ui.syn()
 
     def move(self, dx: int, dy: int):
@@ -298,11 +291,17 @@ class AbsoluteInputController:
 controller = AbsoluteInputController()
 
 def update_desktop_resolution():
-    global screen_width, screen_height
+    global screen_width, screen_height, cur_x, cur_y
     w, h = detect_desktop_resolution()
-    if w != screen_width or h != screen_height:
-        screen_width, screen_height = w, h
-        controller.reinit(w, h)
+    if w > 0 and h > 0 and (w != screen_width or h != screen_height):
+        print(f"[SCREEN] Aktualizace rozlišení: {screen_width}x{screen_height} -> {w}x{h}")
+        with pos_lock:
+            # Poměrný přepočet pozice myši do nového rozlišení
+            cur_x = int((cur_x / max(1, screen_width - 1)) * (w - 1))
+            cur_y = int((cur_y / max(1, screen_height - 1)) * (h - 1))
+            screen_width = w
+            screen_height = h
+        controller.sync()
     return screen_width, screen_height
 
 # --- SNÍMÁNÍ OBRAZOVKY ---
