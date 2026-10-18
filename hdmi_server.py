@@ -20,8 +20,8 @@ def detect_desktop_resolution():
         cmd = [
             "runuser", "-u", USER, "--",
             "env", f"XDG_RUNTIME_DIR={RUNTIME_DIR}", "WAYLAND_DISPLAY=wayland-0",
-            "grim", temp
-        ] if os.getuid() == 0 else ["grim", temp]
+            "grim", "-s", "1", temp
+        ] if os.getuid() == 0 else ["grim", "-s", "1", temp]
         
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
         if os.path.exists(temp):
@@ -41,27 +41,22 @@ pos_lock = threading.Lock()
 
 # --- OVLÁDÁNÍ ZVUKU ---
 def refresh_audio():
-    # 1. Obnova udev a ALSA bez zabíjení běžících zvukových démonů
     for cmd in ["udevadm trigger --subsystem-match=sound", "alsactl restore"]:
         try:
             subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
 
-    # 2. Šetrný restart WirePlumberu přes systemd (PipeWire zůstane běžet -> lišta a ovládání zvuku nezmizí)
     try:
         cmd_wp = f"runuser -u {USER} -- env XDG_RUNTIME_DIR={RUNTIME_DIR} systemctl --user restart wireplumber"
         subprocess.run(cmd_wp, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
-    # 3. Krátká prodleva pro načtení koncových bodů (endpoints) WirePlumberem
     time.sleep(1.5)
 
     try:
         env_prefix = f"runuser -u {USER} -- env XDG_RUNTIME_DIR={RUNTIME_DIR}"
-        
-        # Zjištění názvu HDMI sinku
         cmd_sink = f"{env_prefix} pactl list sinks short"
         res = subprocess.run(cmd_sink, shell=True, capture_output=True, text=True)
         
@@ -74,11 +69,8 @@ def refresh_audio():
                     break
 
         if hdmi_sink:
-            # Nastavit HDMI jako výchozí výstup pro nové aplikace
             subprocess.run(f"{env_prefix} pactl set-default-sink {hdmi_sink}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
-            # PŘESUN BĚŽÍCÍCH STREAMŮ (např. hrající VLC):
-            # Přesměruje všechny právě přehrávané audio streamy přímo do HDMI
             cmd_inputs = f"{env_prefix} pactl list sink-inputs short"
             res_inputs = subprocess.run(cmd_inputs, shell=True, capture_output=True, text=True)
             for line in res_inputs.stdout.strip().splitlines():
@@ -92,10 +84,16 @@ def refresh_audio():
     except Exception as ex:
         print(f"[AUDIO] Chyba při obnově audia: {ex}")
 
+# ZVUK: čeká 5 sekund
 def delayed_audio_refresh():
-    # Čekání 10 sekund na probuzení TV/monitoru a ustálení HDMI spojení
-    time.sleep(10.0)
+    time.sleep(5.0)
     refresh_audio()
+
+# OBRAZ A MYŠ: čeká 5 sekund
+def delayed_screen_refresh():
+    time.sleep(5.0)
+    update_desktop_resolution()
+    controller.center()
 
 # --- OVLÁDÁNÍ HDMI ---
 def find_hdmi_status_path():
@@ -114,6 +112,8 @@ def set_hdmi(enable: bool) -> bool:
         with open(HDMI_STATUS_PATH, "w") as f:
             f.write(state_str + "\n")
         if enable:
+            # Obě akce se spustí se zpožděním 5 sekund
+            threading.Thread(target=delayed_screen_refresh, daemon=True).start()
             threading.Thread(target=delayed_audio_refresh, daemon=True).start()
         return True
     except Exception:
@@ -151,7 +151,6 @@ if HAS_EVDEV:
         'Right': e.KEY_RIGHT
     }
 
-    # Běžná písmena kromě Y a Z
     for ch in "abcdefghijklmnopqrstuvwx":
         key_code = getattr(e, f"KEY_{ch.upper()}", None)
         if key_code:
@@ -159,7 +158,6 @@ if HAS_EVDEV:
             CHAR_KEY_MAP[ch.upper()] = (key_code, True)
             VALID_KEY_CODES.append(key_code)
 
-    # ⚡ FIX PRO ČESKÉ QWERTZ ROZLOŽENÍ: PROHOZENÍ Y a Z
     CHAR_KEY_MAP['y'] = (e.KEY_Z, False)
     CHAR_KEY_MAP['Y'] = (e.KEY_Z, True)
     CHAR_KEY_MAP['z'] = (e.KEY_Y, False)
@@ -203,19 +201,30 @@ class AbsoluteInputController:
     def __init__(self):
         self.ui = None
         if HAS_EVDEV:
+            self.reinit(screen_width, screen_height)
+
+    def reinit(self, w, h):
+        if not HAS_EVDEV:
+            return
+        if self.ui:
             try:
-                cap = {
-                    e.EV_ABS: [
-                        (e.ABS_X, evdev.AbsInfo(value=cur_x, min=0, max=screen_width - 1, fuzz=0, flat=0, resolution=1)),
-                        (e.ABS_Y, evdev.AbsInfo(value=cur_y, min=0, max=screen_height - 1, fuzz=0, flat=0, resolution=1))
-                    ],
-                    e.EV_KEY: VALID_KEY_CODES
-                }
-                self.ui = UInput(cap, name="RPi-Web-Absolute-Pointer")
-                print(f"[INPUT] Absolutní ukazatel aktivován ({screen_width}x{screen_height}).")
-                self.sync()
-            except Exception as ex:
-                print(f"[INPUT] Chyba inicializace evdev: {ex}")
+                self.ui.close()
+            except Exception:
+                pass
+            self.ui = None
+        try:
+            cap = {
+                e.EV_ABS: [
+                    (e.ABS_X, evdev.AbsInfo(value=cur_x, min=0, max=w - 1, fuzz=0, flat=0, resolution=1)),
+                    (e.EV_ABS, evdev.AbsInfo(value=cur_y, min=0, max=h - 1, fuzz=0, flat=0, resolution=1))
+                ],
+                e.EV_KEY: VALID_KEY_CODES
+            }
+            self.ui = UInput(cap, name="RPi-Web-Absolute-Pointer")
+            print(f"[INPUT] Absolutní ukazatel inicializován na {w}x{h}.")
+            self.sync()
+        except Exception as ex:
+            print(f"[INPUT] Chyba inicializace evdev: {ex}")
 
     def sync(self):
         if self.ui:
@@ -229,6 +238,14 @@ class AbsoluteInputController:
             cur_x = max(0, min(screen_width - 1, cur_x + dx))
             cur_y = max(0, min(screen_height - 1, cur_y + dy))
         self.sync()
+
+    def center(self):
+        global cur_x, cur_y
+        with pos_lock:
+            cur_x = screen_width // 2
+            cur_y = screen_height // 2
+        self.sync()
+        print(f"[INPUT] Myš vycentrována na střed: {cur_x}, {cur_y}")
 
     def click(self, button: str = "left"):
         if self.ui:
@@ -249,7 +266,6 @@ class AbsoluteInputController:
             self.ui.syn()
 
     def type_text(self, text: str):
-        # 1. PŘEDNOSTNĚ: wtype (perfektní pro Wayland, podporuje háčky, čárky a neničí Y/Z)
         cmd = [
             "runuser", "-u", USER, "--",
             "env", f"XDG_RUNTIME_DIR={RUNTIME_DIR}", "WAYLAND_DISPLAY=wayland-0",
@@ -263,7 +279,6 @@ class AbsoluteInputController:
         except Exception:
             pass
 
-        # 2. ZÁLOŽNĚ: evdev s opraveným QWERTZ mapováním
         if not self.ui:
             return
         for char in text:
@@ -281,6 +296,14 @@ class AbsoluteInputController:
                 time.sleep(0.005)
 
 controller = AbsoluteInputController()
+
+def update_desktop_resolution():
+    global screen_width, screen_height
+    w, h = detect_desktop_resolution()
+    if w != screen_width or h != screen_height:
+        screen_width, screen_height = w, h
+        controller.reinit(w, h)
+    return screen_width, screen_height
 
 # --- SNÍMÁNÍ OBRAZOVKY ---
 last_capture_time = 0
@@ -318,8 +341,8 @@ def capture_screen(req_w, req_h):
     cmd = [
         "runuser", "-u", USER, "--",
         "env", f"XDG_RUNTIME_DIR={RUNTIME_DIR}", "WAYLAND_DISPLAY=wayland-0",
-        "grim", "-c", "-g", geom, temp_raw
-    ] if os.getuid() == 0 else ["grim", "-c", "-g", geom, temp_raw]
+        "grim", "-s", "1", "-c", "-g", geom, temp_raw
+    ] if os.getuid() == 0 else ["grim", "-s", "1", "-c", "-g", geom, temp_raw]
 
     try:
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1)
@@ -376,6 +399,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .btn-on { background-color: #16a34a; }
         .btn-off { background-color: #dc2626; }
         .btn-audio { background-color: #2563eb; }
+        .btn-center { background-color: #d97706; }
         .btn-kbd { background-color: #0ea5e9; }
         .btn-stream { background-color: #7c3aed; }
         .btn-close { background-color: #991b1b; }
@@ -438,6 +462,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <a href="/hdmi/on" class="btn-action btn-on">Zapnout</a>
             <a href="/hdmi/off" class="btn-action btn-off">Vypnout</a>
             <button class="btn-action btn-audio" id="btn-audio" onclick="triggerAudioRefresh()">🔊 Zvuk</button>
+            <button class="btn-action btn-center" onclick="centerMouse()">🎯 Střed</button>
         </div>
 
         <div id="keyboard-panel">
@@ -514,6 +539,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             nextImg.src = `/api/screen/crop?w=${w}&h=${h}&t=${Date.now()}`;
         }
         setInterval(updateScreen, 120);
+
+        function centerMouse() {
+            fetch('/api/mouse/center', { method: 'POST' })
+                .then(() => setTimeout(updateScreen, 50));
+        }
 
         function toggleKeyboard() {
             if (kbdPanel.style.display === "flex") {
@@ -705,6 +735,11 @@ class ServerHandler(BaseHTTPRequestHandler):
                 self._send_status(204)
             except Exception:
                 self._send_status(400)
+
+        elif path == "/api/mouse/center":
+            update_desktop_resolution()
+            controller.center()
+            self._send_status(204)
 
         elif path == "/api/mouse/click":
             btn = params.get("btn", ["left"])[0]
