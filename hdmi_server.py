@@ -14,8 +14,7 @@ PORT = 1111
 USER = os.environ.get("RPI_USER")
 USER_UID = os.environ.get("RPI_UID")
 
-# Pokud proměnné nejsou nastaveny (např. při ručním spuštění přes sudo),
-# zjistí se skutečný uživatel a jeho UID dynamicky přímo ze systému:
+# Pokud proměnné nejsou nastaveny, zjistí se dynamicky ze systému:
 if not USER or not USER_UID:
     sudo_user = os.environ.get("SUDO_USER")
     if sudo_user and sudo_user != "root":
@@ -27,9 +26,9 @@ if not USER or not USER_UID:
 
 RUNTIME_DIR = f"/run/user/{USER_UID}"
 
-print(f"[CONFIG] Načtený uživatel: {USER} | UID: {USER_UID} | Runtime: {RUNTIME_DIR}")
+print(f"[CONFIG] Uživatel: {USER} | UID: {USER_UID} | Runtime: {RUNTIME_DIR}")
 
-# Kontrola root oprávnění (nutné pro zápis do /dev/uinput)
+# Kontrola root oprávnění
 if os.getuid() != 0:
     print("\n" + "!" * 65)
     print(" [VAROVÁNÍ] Skript neběží pod SUDO!")
@@ -45,7 +44,6 @@ def refresh_audio():
         except Exception:
             pass
 
-    # Šetrný restart WirePlumberu přes systemd daného uživatele
     try:
         cmd_wp = f"runuser -u {USER} -- env XDG_RUNTIME_DIR={RUNTIME_DIR} systemctl --user restart wireplumber"
         subprocess.run(cmd_wp, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -68,10 +66,8 @@ def refresh_audio():
                     break
 
         if hdmi_sink:
-            # Nastavení výchozího výstupu
             subprocess.run(f"{env_prefix} pactl set-default-sink {hdmi_sink}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
-            # Přesun běžících aplikací (např. VLC) do HDMI
             cmd_inputs = f"{env_prefix} pactl list sink-inputs short"
             res_inputs = subprocess.run(cmd_inputs, shell=True, capture_output=True, text=True)
             for line in res_inputs.stdout.strip().splitlines():
@@ -193,13 +189,13 @@ class MouseKeyboardController:
         self.ui = None
         if HAS_EVDEV:
             try:
-                # Nativní relativní myš (REL_X, REL_Y) pro plynulý chod pod Waylandem
+                # Přidána podpora pro REL_WHEEL (kolečko myši)
                 cap = {
-                    e.EV_REL: [e.REL_X, e.REL_Y],
+                    e.EV_REL: [e.REL_X, e.REL_Y, e.REL_WHEEL],
                     e.EV_KEY: VALID_KEY_CODES
                 }
                 self.ui = UInput(cap, name="RPi-Web-Remote-Mouse")
-                print("[INPUT] Virtuální myš a klávesnice úspěšně vytvořena!")
+                print("[INPUT] Virtuální myš (včetně kolečka a držení) úspěšně vytvořena!")
             except Exception as ex:
                 print(f"[CHYBA INPUTU] Nelze otevřít evdev: {ex}")
 
@@ -209,14 +205,23 @@ class MouseKeyboardController:
             self.ui.write(e.EV_REL, e.REL_Y, dy)
             self.ui.syn()
 
-    def click(self, button: str = "left"):
+    def scroll(self, dy: int):
+        if self.ui:
+            # dy > 0 nahoru, dy < 0 dolů
+            self.ui.write(e.EV_REL, e.REL_WHEEL, dy)
+            self.ui.syn()
+
+    def button_event(self, button: str, state: int):
+        # state: 1 = stisknout (držet), 0 = pustit
         if self.ui:
             btn = e.BTN_LEFT if button == "left" else e.BTN_RIGHT
-            self.ui.write(e.EV_KEY, btn, 1)
+            self.ui.write(e.EV_KEY, btn, state)
             self.ui.syn()
-            time.sleep(0.01)
-            self.ui.write(e.EV_KEY, btn, 0)
-            self.ui.syn()
+
+    def click(self, button: str = "left"):
+        self.button_event(button, 1)
+        time.sleep(0.01)
+        self.button_event(button, 0)
 
     def send_key(self, key_name: str):
         if self.ui and key_name in SPECIAL_KEY_MAP:
@@ -228,7 +233,6 @@ class MouseKeyboardController:
             self.ui.syn()
 
     def type_text(self, text: str):
-        # 1. Přednostně wtype pro Wayland
         cmd = [
             "runuser", "-u", USER, "--",
             "env", f"XDG_RUNTIME_DIR={RUNTIME_DIR}", "WAYLAND_DISPLAY=wayland-0",
@@ -242,7 +246,6 @@ class MouseKeyboardController:
         except Exception:
             pass
 
-        # 2. Záložně evdev
         if not self.ui:
             return
         for char in text:
@@ -319,7 +322,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
         .btn-kbd-key:active { background: #38bdf8; color: black; }
 
-        /* TOUCHPAD */
+        /* TOUCHPAD PLOCHA */
         #touchpad {
             flex: 1 1 0;
             min-height: 0;
@@ -328,10 +331,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             border: 2px solid #334155;
             touch-action: none;
             cursor: crosshair;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
         }
         #touchpad.active {
             border-color: #38bdf8;
             background: #0f172a;
+        }
+        #touchpad.dragging {
+            border-color: #f59e0b;
+            background: #171c26;
+        }
+
+        .touchpad-hints {
+            color: #475569;
+            font-size: 0.8rem;
+            pointer-events: none;
+            text-align: center;
+            line-height: 1.5;
         }
 
         .mouse-buttons { flex-shrink: 0; display: flex; gap: 12px; margin-top: 8px; height: 56px; }
@@ -339,7 +358,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             flex: 1; background: #1e293b; color: white; border: 1px solid #475569;
             border-radius: 14px; font-size: 1.05rem; font-weight: 600; touch-action: manipulation; cursor: pointer;
         }
-        .btn-mouse:active { background: #38bdf8; color: black; }
+        .btn-mouse:active, .btn-mouse.held {
+            background: #38bdf8; color: black; border-color: #38bdf8;
+        }
     </style>
 </head>
 <body>
@@ -372,7 +393,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
 
     <!-- TOUCHPAD PLOCHA -->
-    <div id="touchpad"></div>
+    <div id="touchpad">
+        <div class="touchpad-hints">
+            <span>👆 1 prst: Pohyb myši / Kliknutí</span><br>
+            <span>✌️ 2 prsty: Kolečko myši (Scroll)</span><br>
+            <span>✊ 2× klepnout a táhnout: Přichycení okna</span>
+        </div>
+    </div>
 
     <div class="mouse-buttons">
         <button class="btn-mouse" id="btn-left">Levé tlačítko</button>
@@ -390,7 +417,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         let startTime = 0;
         let accX = 0, accY = 0;
         let isSending = false;
-        let isMouseDown = false;
+
+        // Kolečko (2 prsty)
+        let isTwoFinger = false;
+        let lastTwoY = 0;
+        let accScroll = 0;
+
+        // Přichycení (Drag & drop)
+        let lastTapTime = 0;
+        let isDragging = false;
 
         function flushMove() {
             if ((accX !== 0 || accY !== 0) && !isSending) {
@@ -404,6 +439,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             }
         }
         setInterval(flushMove, 16);
+
+        function flushScroll() {
+            if (accScroll !== 0) {
+                const step = Math.trunc(accScroll / 20);
+                if (step !== 0) {
+                    accScroll -= (step * 20);
+                    fetch('/api/mouse/wheel?dy=' + step, { method: 'POST' });
+                }
+            }
+        }
+        setInterval(flushScroll, 30);
 
         function toggleKeyboard() {
             if (kbdPanel.style.display === "flex") {
@@ -443,18 +489,51 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        // Dotyk (mobil)
+        // --- DOTYKOVÉ OVLÁDÁNÍ (MOBIL) ---
         pad.addEventListener("touchstart", (e) => {
             e.preventDefault();
-            pad.classList.add("active");
+
+            // 1. REŽIM KOLEČKA (2 PRSTY)
+            if (e.touches.length === 2) {
+                isTwoFinger = true;
+                lastTwoY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+                accScroll = 0;
+                return;
+            }
+
+            // 2. REŽIM 1 PRST
+            isTwoFinger = false;
             const t = e.touches[0];
             lastX = t.clientX; lastY = t.clientY;
             startX = t.clientX; startY = t.clientY;
-            startTime = Date.now();
+            const now = Date.now();
+
+            // Detekce dvojitého klepnutí a držení (pro přichycení okna)
+            if (now - lastTapTime < 280) {
+                isDragging = true;
+                pad.classList.add("dragging");
+                fetch('/api/mouse/press?btn=left&state=1', { method: 'POST' });
+            } else {
+                pad.classList.add("active");
+            }
+            startTime = now;
         }, { passive: false });
 
         pad.addEventListener("touchmove", (e) => {
             e.preventDefault();
+
+            // 2 PRSTY = KOLEČKO MYŠI
+            if (e.touches.length === 2) {
+                const currentY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+                const diff = currentY - lastTwoY;
+                lastTwoY = currentY;
+                accScroll += diff; // táhnutí nahoru/dolů
+                return;
+            }
+
+            if (isTwoFinger) return;
+
+            // 1 PRST = POHYB (NEBO TAŽENÍ PŘICHYCENÉHO OKNA)
             const t = e.touches[0];
             accX += Math.round((t.clientX - lastX) * SENSITIVITY);
             accY += Math.round((t.clientY - lastY) * SENSITIVITY);
@@ -463,38 +542,73 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         pad.addEventListener("touchend", (e) => {
             e.preventDefault();
+
+            if (isTwoFinger) {
+                if (e.touches.length < 2) isTwoFinger = false;
+                return;
+            }
+
             pad.classList.remove("active");
+
+            // Konec přichycení
+            if (isDragging) {
+                isDragging = false;
+                pad.classList.remove("dragging");
+                fetch('/api/mouse/press?btn=left&state=0', { method: 'POST' });
+                lastTapTime = 0;
+                return;
+            }
+
+            // Běžné klepnutí (klik)
             const dist = Math.hypot(lastX - startX, lastY - startY);
-            if (dist < 8 && (Date.now() - startTime) < 250) {
+            const now = Date.now();
+            if (dist < 10 && (now - startTime) < 250) {
                 sendClick('left');
+                lastTapTime = now;
+            } else {
+                lastTapTime = 0;
             }
         }, { passive: false });
 
-        // Myš (pro test z PC)
-        pad.addEventListener("mousedown", (e) => {
-            isMouseDown = true;
-            pad.classList.add("active");
-            lastX = e.clientX; lastY = e.clientY;
-            startX = e.clientX; startY = e.clientY;
-            startTime = Date.now();
-        });
+        // --- PODPORA KOLEČKA PŘI TESTU Z PC ---
+        pad.addEventListener("wheel", (e) => {
+            e.preventDefault();
+            const step = e.deltaY < 0 ? 1 : -1;
+            fetch('/api/mouse/wheel?dy=' + step, { method: 'POST' });
+        }, { passive: false });
 
-        window.addEventListener("mousemove", (e) => {
-            if (!isMouseDown) return;
-            accX += Math.round((e.clientX - lastX) * SENSITIVITY);
-            accY += Math.round((e.clientY - lastY) * SENSITIVITY);
-            lastX = e.clientX; lastY = e.clientY;
-        });
+        // --- SPODNÍ TLAČÍTKA S PODPOROU DRŽENÍ ---
+        function setupHoldButton(btnId, buttonName) {
+            const btn = document.getElementById(btnId);
 
-        window.addEventListener("mouseup", (e) => {
-            if (!isMouseDown) return;
-            isMouseDown = false;
-            pad.classList.remove("active");
-            const dist = Math.hypot(lastX - startX, lastY - startY);
-            if (dist < 8 && (Date.now() - startTime) < 250) {
-                sendClick('left');
-            }
-        });
+            // Mobil
+            btn.addEventListener("touchstart", (e) => {
+                e.preventDefault();
+                btn.classList.add("held");
+                fetch(`/api/mouse/press?btn=${buttonName}&state=1`, { method: 'POST' });
+            }, { passive: false });
+
+            btn.addEventListener("touchend", (e) => {
+                e.preventDefault();
+                btn.classList.remove("held");
+                fetch(`/api/mouse/press?btn=${buttonName}&state=0`, { method: 'POST' });
+            }, { passive: false });
+
+            // PC myš
+            btn.addEventListener("mousedown", (e) => {
+                btn.classList.add("held");
+                fetch(`/api/mouse/press?btn=${buttonName}&state=1`, { method: 'POST' });
+            });
+            window.addEventListener("mouseup", (e) => {
+                if (btn.classList.contains("held")) {
+                    btn.classList.remove("held");
+                    fetch(`/api/mouse/press?btn=${buttonName}&state=0`, { method: 'POST' });
+                }
+            });
+        }
+
+        setupHoldButton("btn-left", "left");
+        setupHoldButton("btn-right", "right");
 
         function sendClick(btn) {
             fetch('/api/mouse/click?btn=' + btn, { method: 'POST' });
@@ -516,9 +630,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     setTimeout(() => { btn.innerText = originalText; btn.disabled = false; }, 2000);
                 });
         }
-
-        document.getElementById("btn-left").addEventListener("click", () => sendClick('left'));
-        document.getElementById("btn-right").addEventListener("click", () => sendClick('right'));
     </script>
 </body>
 </html>
@@ -549,6 +660,7 @@ class ServerHandler(BaseHTTPRequestHandler):
         path = parsed.path
         params = parse_qs(parsed.query)
 
+        # 1. Pohyb myši
         if path == "/api/mouse/move":
             try:
                 dx = int(params.get("dx", [0])[0])
@@ -558,11 +670,32 @@ class ServerHandler(BaseHTTPRequestHandler):
             except Exception:
                 self._send_status(400)
 
+        # 2. Kolečko myši (Scroll)
+        elif path == "/api/mouse/wheel":
+            try:
+                dy = int(params.get("dy", [0])[0])
+                controller.scroll(dy)
+                self._send_status(204)
+            except Exception:
+                self._send_status(400)
+
+        # 3. Držení tlačítka (Přichycení)
+        elif path == "/api/mouse/press":
+            try:
+                btn = params.get("btn", ["left"])[0]
+                state = int(params.get("state", [1])[0])
+                controller.button_event(btn, state)
+                self._send_status(204)
+            except Exception:
+                self._send_status(400)
+
+        # 4. Jednorázový klik
         elif path == "/api/mouse/click":
             btn = params.get("btn", ["left"])[0]
             controller.click(btn)
             self._send_status(204)
 
+        # 5. Klávesnice
         elif path == "/api/keyboard/key":
             key_name = params.get("key", [""])[0]
             if key_name:
@@ -614,8 +747,8 @@ class ServerHandler(BaseHTTPRequestHandler):
         self.wfile.write(html.encode("utf-8"))
 
     def log_message(self, format, *args):
-        # Filtruje logy pohybu myši
-        if len(args) > 0 and "api/mouse" in str(args[0]):
+        # Filtruje časté logy pohybu a kolečka, ať nezaplavují terminál
+        if len(args) > 0 and any(k in str(args[0]) for k in ["api/mouse/move", "api/mouse/wheel"]):
             return
         print(f"[HTTP] {self.address_string()} - {format % args}")
 
