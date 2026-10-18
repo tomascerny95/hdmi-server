@@ -6,39 +6,20 @@ import threading
 import subprocess
 from urllib.parse import urlparse, parse_qs
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from PIL import Image
 
 PORT = 1111
 USER = "cernytom"
 RUNTIME_DIR = "/run/user/1000"
 
-# --- ZJIŠTĚNÍ ROZLIŠENÍ PLOCHY (pouze jednou při startu) ---
-def detect_desktop_resolution():
-    temp = "/dev/shm/rpi_detect.png"
-    try:
-        cmd = [
-            "runuser", "-u", USER, "--",
-            "env", f"XDG_RUNTIME_DIR={RUNTIME_DIR}", "WAYLAND_DISPLAY=wayland-0",
-            "grim", temp
-        ] if os.getuid() == 0 else ["grim", temp]
-        
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
-        if os.path.exists(temp):
-            img = Image.open(temp)
-            w, h = img.size
-            os.remove(temp)
-            print(f"[SCREEN] Rozlišení plochy: {w}x{h}")
-            return w, h
-    except Exception:
-        pass
-    return 1920, 1080
+# KONTROLA PRÁV ROOT (bez sudo myš v Linuxu nefunguje!)
+if os.getuid() != 0:
+    print("\n" + "!" * 65)
+    print(" [VAROVÁNÍ] Skript neběží pod SUDO!")
+    print(" Linux nedovolí ovládat myš bez oprávnění root.")
+    print(" Spusťte skript příkazem:  sudo python3 " + os.path.basename(__file__))
+    print("!" * 65 + "\n")
 
-screen_width, screen_height = detect_desktop_resolution()
-cur_x = screen_width // 2
-cur_y = screen_height // 2
-pos_lock = threading.Lock()
-
-# --- SPOLEHLIVÉ OVLÁDÁNÍ ZVUKU (neodstřeluje lištu a drží VLC) ---
+# --- SPOLEHLIVÉ OVLÁDÁNÍ ZVUKU ---
 def refresh_audio():
     for cmd in ["udevadm trigger --subsystem-match=sound", "alsactl restore"]:
         try:
@@ -46,7 +27,6 @@ def refresh_audio():
         except Exception:
             pass
 
-    # Šetrný restart WirePlumberu přes systemd
     try:
         cmd_wp = f"runuser -u {USER} -- env XDG_RUNTIME_DIR={RUNTIME_DIR} systemctl --user restart wireplumber"
         subprocess.run(cmd_wp, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -69,10 +49,9 @@ def refresh_audio():
                     break
 
         if hdmi_sink:
-            # Nastavit HDMI jako výchozí výstup
             subprocess.run(f"{env_prefix} pactl set-default-sink {hdmi_sink}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
-            # PŘESUN BĚŽÍCÍCH STREAMŮ (VLC nepřestane hrát):
+            # Přesun běžících aplikací (např. VLC)
             cmd_inputs = f"{env_prefix} pactl list sink-inputs short"
             res_inputs = subprocess.run(cmd_inputs, shell=True, capture_output=True, text=True)
             for line in res_inputs.stdout.strip().splitlines():
@@ -80,7 +59,7 @@ def refresh_audio():
                 if parts:
                     input_id = parts[0]
                     subprocess.run(f"{env_prefix} pactl move-sink-input {input_id} {hdmi_sink}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            print(f"[AUDIO] Úspěšně přepnuto na HDMI: {hdmi_sink}")
+            print(f"[AUDIO] Přepnuto na HDMI: {hdmi_sink}")
     except Exception as ex:
         print(f"[AUDIO] Chyba při obnově: {ex}")
 
@@ -117,7 +96,7 @@ def get_hdmi_status() -> str:
     except Exception:
         return "neznámý"
 
-# --- OVLÁDÁNÍ MYŠI A KLÁVESNICE (přesně podle vašeho vzoru) ---
+# --- OVLÁDÁNÍ MYŠI A KLÁVESNICE ---
 try:
     import evdev
     from evdev import UInput, ecodes as e
@@ -149,7 +128,7 @@ if HAS_EVDEV:
             CHAR_KEY_MAP[ch.upper()] = (key_code, True)
             VALID_KEY_CODES.append(key_code)
 
-    # FIX PRO ČESKÉ QWERTZ
+    # QWERTZ FIX
     CHAR_KEY_MAP['y'] = (e.KEY_Z, False)
     CHAR_KEY_MAP['Y'] = (e.KEY_Z, True)
     CHAR_KEY_MAP['z'] = (e.KEY_Y, False)
@@ -189,36 +168,27 @@ if HAS_EVDEV:
     ])
     VALID_KEY_CODES = list(set(VALID_KEY_CODES))
 
-class AbsoluteInputController:
+class MouseKeyboardController:
     def __init__(self):
         self.ui = None
         if HAS_EVDEV:
             try:
+                # Nativní relativní myš (REL_X, REL_Y) - Wayland ji bere jako standardní USB myš
                 cap = {
-                    e.EV_ABS: [
-                        (e.ABS_X, evdev.AbsInfo(value=cur_x, min=0, max=screen_width - 1, fuzz=0, flat=0, resolution=1)),
-                        (e.EV_ABS, evdev.AbsInfo(value=cur_y, min=0, max=screen_height - 1, fuzz=0, flat=0, resolution=1))
-                    ],
+                    e.EV_REL: [e.REL_X, e.REL_Y],
                     e.EV_KEY: VALID_KEY_CODES
                 }
-                self.ui = UInput(cap, name="RPi-Web-Absolute-Pointer")
-                print(f"[INPUT] Absolutní ukazatel aktivován ({screen_width}x{screen_height}).")
-                self.sync()
+                self.ui = UInput(cap, name="RPi-Web-Remote-Mouse")
+                print("[INPUT] Virtuální myš a klávesnice úspěšně vytvořena!")
             except Exception as ex:
-                print(f"[INPUT] Chyba inicializace evdev: {ex}")
-
-    def sync(self):
-        if self.ui:
-            self.ui.write(e.EV_ABS, e.ABS_X, cur_x)
-            self.ui.write(e.EV_ABS, e.ABS_Y, cur_y)
-            self.ui.syn()
+                print(f"[CHYBA INPUTU] Nelze otevřít evdev: {ex}")
+                print(" -> Běží skript s právy root (sudo)?")
 
     def move(self, dx: int, dy: int):
-        global cur_x, cur_y
-        with pos_lock:
-            cur_x = max(0, min(screen_width - 1, cur_x + dx))
-            cur_y = max(0, min(screen_height - 1, cur_y + dy))
-        self.sync()
+        if self.ui:
+            self.ui.write(e.EV_REL, e.REL_X, dx)
+            self.ui.write(e.EV_REL, e.REL_Y, dy)
+            self.ui.syn()
 
     def click(self, button: str = "left"):
         if self.ui:
@@ -239,7 +209,6 @@ class AbsoluteInputController:
             self.ui.syn()
 
     def type_text(self, text: str):
-        # 1. PŘEDNOSTNĚ: wtype
         cmd = [
             "runuser", "-u", USER, "--",
             "env", f"XDG_RUNTIME_DIR={RUNTIME_DIR}", "WAYLAND_DISPLAY=wayland-0",
@@ -253,7 +222,6 @@ class AbsoluteInputController:
         except Exception:
             pass
 
-        # 2. ZÁLOŽNĚ: evdev
         if not self.ui:
             return
         for char in text:
@@ -270,9 +238,9 @@ class AbsoluteInputController:
                 self.ui.syn()
                 time.sleep(0.005)
 
-controller = AbsoluteInputController()
+controller = MouseKeyboardController()
 
-# --- HTML ŠABLONA PRO MOBILNÍ TOUCHPAD ---
+# --- WEBOVÉ ROZHRANÍ ---
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="cs">
 <head>
@@ -330,34 +298,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
         .btn-kbd-key:active { background: #38bdf8; color: black; }
 
-        /* TOUCHPAD PLOCHA */
+        /* TOUCHPAD */
         #touchpad {
             flex: 1 1 0;
             min-height: 0;
-            position: relative;
-            background: radial-gradient(circle, #1e293b 0%, #0f172a 100%);
+            background: #020617;
             border-radius: 16px;
             border: 2px solid #334155;
-            display: flex;
-            align-items: center;
-            justify-content: center;
             touch-action: none;
             cursor: crosshair;
         }
         #touchpad.active {
             border-color: #38bdf8;
-            background: radial-gradient(circle, #253349 0%, #111a2e 100%);
-        }
-        .touchpad-label {
-            color: #64748b;
-            font-size: 1.1rem;
-            font-weight: 500;
-            letter-spacing: 1px;
-            pointer-events: none;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            gap: 8px;
+            background: #0f172a;
         }
 
         .mouse-buttons { flex-shrink: 0; display: flex; gap: 12px; margin-top: 8px; height: 56px; }
@@ -397,13 +350,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
     </div>
 
-    <!-- TOUCHPAD -->
-    <div id="touchpad">
-        <div class="touchpad-label">
-            <span style="font-size:2rem;">🖱️</span>
-            <span>Dotyková plocha</span>
-        </div>
-    </div>
+    <!-- TOUCHPAD PLOCHA -->
+    <div id="touchpad"></div>
 
     <div class="mouse-buttons">
         <button class="btn-mouse" id="btn-left">Levé tlačítko</button>
@@ -415,7 +363,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         const kbdPanel = document.getElementById("keyboard-panel");
         const kbdInput = document.getElementById("kbd-input");
 
-        const SENSITIVITY = 1.4;
+        const SENSITIVITY = 1.3;
         let lastX = 0, lastY = 0;
         let startX = 0, startY = 0;
         let startTime = 0;
@@ -434,7 +382,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     .finally(() => { isSending = false; });
             }
         }
-        setInterval(flushMove, 20);
+        setInterval(flushMove, 16);
 
         function toggleKeyboard() {
             if (kbdPanel.style.display === "flex") {
@@ -470,12 +418,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 document.body.innerHTML = `
                     <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100dvh;color:#94a3b8;font-size:1.2rem;text-align:center;padding:20px;">
                         <span>Aplikace byla ukončena.</span>
-                        <span style="font-size:0.9rem;margin-top:10px;color:#64748b;">Můžete zavřít tuto záložku.</span>
                     </div>`;
             }
         }
 
-        // Dotykové ovládání (mobil)
+        // Dotyk (mobil)
         pad.addEventListener("touchstart", (e) => {
             e.preventDefault();
             pad.classList.add("active");
@@ -497,13 +444,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             e.preventDefault();
             pad.classList.remove("active");
             const dist = Math.hypot(lastX - startX, lastY - startY);
-            // Klepnutí kratší než 250 ms bez posunu = kliknutí
             if (dist < 8 && (Date.now() - startTime) < 250) {
                 sendClick('left');
             }
         }, { passive: false });
 
-        // Myš (testování z PC)
+        // Myš (PC test)
         pad.addEventListener("mousedown", (e) => {
             isMouseDown = true;
             pad.classList.add("active");
@@ -647,7 +593,6 @@ class ServerHandler(BaseHTTPRequestHandler):
         self.wfile.write(html.encode("utf-8"))
 
     def log_message(self, format, *args):
-        # Filtruje logy pohybu myši, ať nezaplavují terminál
         if len(args) > 0 and "api/mouse" in str(args[0]):
             return
         print(f"[HTTP] {self.address_string()} - {format % args}")
@@ -658,7 +603,7 @@ def run_server(port):
 
     server_address = ("", port)
     httpd = ThreadingHTTPServer(server_address, ServerHandler)
-    print(f"[SERVER] Běží na portu {port} (Touchpad + Klávesnice + Zvuk)")
+    print(f"[SERVER] Běží na portu {port}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
