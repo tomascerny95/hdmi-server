@@ -17,15 +17,16 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_NAME="hdmi_server.py"
 SERVICE_NAME="hdmi-server.service"
 
-# 3. Automatická detekce skutečného uživatele (i při spuštění přes sudo)
+# 3. Automatická detekce skutečného uživatele a jeho UID (i při sudo)
 if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
   RUN_USER="$SUDO_USER"
 else
-  # Fallback: vlastník složky s projektem
   RUN_USER="$(stat -c '%U' "$PROJECT_DIR")"
 fi
 
-echo "[+] Detekován uživatel: $RUN_USER"
+RUN_UID="$(id -u "$RUN_USER")"
+
+echo "[+] Detekován uživatel: $RUN_USER (UID: $RUN_UID)"
 echo "[+] Cesta projektu:     $PROJECT_DIR"
 
 # 4. Kontrola přítomnosti Python skriptu
@@ -36,23 +37,31 @@ fi
 
 chmod +x "$PROJECT_DIR/$SCRIPT_NAME"
 
-# 5. Kontrola Python 3
-if ! command -v python3 &> /dev/null; then
-  echo "[+] Instaluji python3..."
-  apt-get update && apt-get install -y python3
-fi
+# 5. Kontrola a instalace závislostí (Python3, evdev pro myš, wtype pro klávesnici)
+echo "[+] Kontrola potřebných balíčků..."
+apt-get update -qq
+apt-get install -y -qq python3 python3-evdev wtype pulseaudio-utils
 
-# 6. Generování systemd služby pro běh přímo v projektové složce
+# Ujistíme se, že modul pro virtuální myš je načten v jádře
+modprobe uinput || true
+
+# Povolíme běh uživatelských sessions i po startu bez nutnosti přihlášení
+loginctl enable-linger "$RUN_USER" || true
+
+# 6. Generování systemd služby s předáním uživatele do prostředí
 echo "[+] Vytvářím systemd službu: /etc/systemd/system/$SERVICE_NAME..."
 cat << EOF > "/etc/systemd/system/$SERVICE_NAME"
 [Unit]
 Description=HDMI Web Controller Server
-After=network.target
+After=network.target graphical.target sound.target
+Wants=graphical.target
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=$PROJECT_DIR
+Environment="RPI_USER=$RUN_USER"
+Environment="RPI_UID=$RUN_UID"
 ExecStart=/usr/bin/python3 $PROJECT_DIR/$SCRIPT_NAME
 Restart=always
 RestartSec=5
@@ -73,6 +82,7 @@ LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 echo "========================================================"
 echo "[✓] Instalace dokončena!"
 echo "    Projekt běží z:  $PROJECT_DIR"
+echo "    Uživatel služby: $RUN_USER"
 echo "    HDMI Server:     http://${LOCAL_IP}:1111"
 echo ""
 echo "    Příkazy pro správu:"
