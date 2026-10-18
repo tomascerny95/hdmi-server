@@ -17,7 +17,7 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_NAME="hdmi_server.py"
 SERVICE_NAME="hdmi-server.service"
 
-# 3. Automatická detekce skutečného uživatele a jeho UID (i při sudo)
+# 3. Automatická detekce skutečného uživatele a jeho UID (i při spuštění přes sudo)
 if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
   RUN_USER="$SUDO_USER"
 else
@@ -37,24 +37,27 @@ fi
 
 chmod +x "$PROJECT_DIR/$SCRIPT_NAME"
 
-# 5. Kontrola a instalace závislostí (Python3, evdev pro myš, wtype pro klávesnici)
-echo "[+] Kontrola potřebných balíčků..."
+# 5. Kontrola a instalace potřebných balíčků
+echo "[+] Kontrola a instalace systémových balíčků..."
 apt-get update -qq
 apt-get install -y -qq python3 python3-evdev wtype pulseaudio-utils
 
-# Ujistíme se, že modul pro virtuální myš je načten v jádře
+# Trvalé načtení modulu uinput pro virtuální myš i po restartu
 modprobe uinput || true
+if ! grep -qxF "uinput" /etc/modules; then
+  echo "uinput" >> /etc/modules
+  echo "[+] Modul uinput byl trvale přidán do /etc/modules"
+fi
 
-# Povolíme běh uživatelských sessions i po startu bez nutnosti přihlášení
+# Povolení běhu uživatelských sessions i po startu bez nutnosti přihlášení
 loginctl enable-linger "$RUN_USER" || true
 
-# 6. Generování systemd služby s předáním uživatele do prostředí
+# 6. Generování systemd služby (ČISTÁ VERZE BEZ CYKLICKÝCH SMYČEK)
 echo "[+] Vytvářím systemd službu: /etc/systemd/system/$SERVICE_NAME..."
 cat << EOF > "/etc/systemd/system/$SERVICE_NAME"
 [Unit]
 Description=HDMI Web Controller Server
-After=network.target graphical.target sound.target
-Wants=graphical.target
+After=network.target sound.target
 
 [Service]
 Type=simple
@@ -80,7 +83,7 @@ LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 [ -z "$LOCAL_IP" ] && LOCAL_IP="localhost"
 
 echo "========================================================"
-echo "[✓] Instalace dokončena!"
+echo "[✓] Instalace dokončena a služba běží!"
 echo "    Projekt běží z:  $PROJECT_DIR"
 echo "    Uživatel služby: $RUN_USER"
 echo "    HDMI Server:     http://${LOCAL_IP}:1111"
