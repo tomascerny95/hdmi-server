@@ -144,7 +144,6 @@ if HAS_EVDEV:
             CHAR_KEY_MAP[ch.upper()] = (key_code, True)
             VALID_KEY_CODES.append(key_code)
 
-    # QWERTZ FIX
     CHAR_KEY_MAP['y'] = (e.KEY_Z, False)
     CHAR_KEY_MAP['Y'] = (e.KEY_Z, True)
     CHAR_KEY_MAP['z'] = (e.KEY_Y, False)
@@ -377,14 +376,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <button class="btn-action btn-audio" id="btn-audio" onclick="triggerAudioRefresh()">🔊 Zvuk</button>
         </div>
 
-        <!-- PANEL KLÁVESNICE -->
         <div id="keyboard-panel">
             <form onsubmit="submitText(event)" class="kbd-row">
                 <input type="text" id="kbd-input" placeholder="Zde pište text do Raspberry..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
                 <button type="submit" class="btn-kbd-key" style="background:#0ea5e9;">Odeslat</button>
             </form>
 
-            <!-- Řádek 1: Běžné klávesy -->
             <div class="kbd-row">
                 <button class="btn-kbd-key" style="flex:1;" onclick="sendKey('Esc')">Esc</button>
                 <button class="btn-kbd-key" style="flex:1;" onclick="sendKey('Tab')">Tab</button>
@@ -392,7 +389,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <button class="btn-kbd-key" style="flex:1.4; background:#16a34a;" onclick="sendKey('Enter')">↵ Enter</button>
             </div>
 
-            <!-- Řádek 2: Mezerník + Šipky -->
             <div class="kbd-row">
                 <button class="btn-kbd-key" style="flex:2.5;" onclick="sendKey('Space')">␣ Mezerník</button>
                 <button class="btn-kbd-key btn-arrow" onclick="sendKey('Left')">←</button>
@@ -406,8 +402,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <!-- TOUCHPAD PLOCHA -->
     <div id="touchpad">
         <div class="touchpad-hints">
-            <span>👆 1 prst: Pohyb myši / Kliknutí</span><br>
-            <span>✌️ 2 prsty: Kolečko myši (Scroll)</span><br>
+            <span>👆 1 prst / myš: Pohyb / Kliknutí</span><br>
+            <span>✌️ 2 prsty / kolečko: Kolečko myši (Scroll)</span><br>
             <span>✊ 2× klepnout a táhnout: Přichycení okna</span>
         </div>
     </div>
@@ -429,14 +425,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         let accX = 0, accY = 0;
         let isSending = false;
 
-        // Kolečko (2 prsty)
+        let isMouseDown = false;
         let isTwoFinger = false;
         let lastTwoY = 0;
         let accScroll = 0;
 
-        // Přichycení (Drag & drop)
         let lastTapTime = 0;
         let isDragging = false;
+
+        // Vypnutí kontextového menu Windows na ploše touchpadu
+        pad.addEventListener("contextmenu", (e) => e.preventDefault());
+        document.body.addEventListener("contextmenu", (e) => {
+            if (e.target.closest('#touchpad, .mouse-buttons')) e.preventDefault();
+        });
 
         function flushMove() {
             if ((accX !== 0 || accY !== 0) && !isSending) {
@@ -500,11 +501,46 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        // --- DOTYKOVÉ OVLÁDÁNÍ (MOBIL) ---
+        // --- 1. OVLÁDÁNÍ MYŠÍ Z PC (WINDOWS CHROME FIX) ---
+        pad.addEventListener("mousedown", (e) => {
+            e.preventDefault(); // Zásadní: zabrání označování textu / blokaci tahu v Chrome na Windows
+            isMouseDown = true;
+            pad.classList.add("active");
+            lastX = e.clientX; lastY = e.clientY;
+            startX = e.clientX; startY = e.clientY;
+            startTime = Date.now();
+        });
+
+        window.addEventListener("mousemove", (e) => {
+            if (!isMouseDown) return;
+            e.preventDefault();
+            accX += Math.round((e.clientX - lastX) * SENSITIVITY);
+            accY += Math.round((e.clientY - lastY) * SENSITIVITY);
+            lastX = e.clientX; lastY = e.clientY;
+        });
+
+        window.addEventListener("mouseup", (e) => {
+            if (!isMouseDown) return;
+            e.preventDefault();
+            isMouseDown = false;
+            pad.classList.remove("active");
+            const dist = Math.hypot(lastX - startX, lastY - startY);
+            if (dist < 6 && (Date.now() - startTime) < 250) {
+                sendClick(e.button === 2 ? 'right' : 'left');
+            }
+        });
+
+        // PC Kolečko myši
+        pad.addEventListener("wheel", (e) => {
+            e.preventDefault();
+            const step = e.deltaY < 0 ? 1 : -1;
+            accScroll += (step * 20);
+        }, { passive: false });
+
+        // --- 2. DOTYKOVÉ OVLÁDÁNÍ (MOBIL) ---
         pad.addEventListener("touchstart", (e) => {
             e.preventDefault();
 
-            // 1. REŽIM KOLEČKA (2 PRSTY)
             if (e.touches.length === 2) {
                 isTwoFinger = true;
                 lastTwoY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
@@ -512,7 +548,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 return;
             }
 
-            // 2. REŽIM 1 PRST
             isTwoFinger = false;
             const t = e.touches[0];
             lastX = t.clientX; lastY = t.clientY;
@@ -532,7 +567,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         pad.addEventListener("touchmove", (e) => {
             e.preventDefault();
 
-            // 2 PRSTY = KOLEČKO
             if (e.touches.length === 2) {
                 const currentY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
                 const diff = currentY - lastTwoY;
@@ -543,7 +577,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
             if (isTwoFinger) return;
 
-            // 1 PRST = POHYB / TAŽENÍ
             const t = e.touches[0];
             accX += Math.round((t.clientX - lastX) * SENSITIVITY);
             accY += Math.round((t.clientY - lastY) * SENSITIVITY);
@@ -578,14 +611,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             }
         }, { passive: false });
 
-        // --- PODPORA KOLEČKA PŘI TESTU Z PC ---
-        pad.addEventListener("wheel", (e) => {
-            e.preventDefault();
-            const step = e.deltaY < 0 ? 1 : -1;
-            fetch('/api/mouse/wheel?dy=' + step, { method: 'POST' });
-        }, { passive: false });
-
-        // --- SPODNÍ TLAČÍTKA S PODPOROU DRŽENÍ ---
+        // --- 3. SPODNÍ TLAČÍTKA ---
         function setupHoldButton(btnId, buttonName) {
             const btn = document.getElementById(btnId);
 
@@ -602,6 +628,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             }, { passive: false });
 
             btn.addEventListener("mousedown", (e) => {
+                e.preventDefault();
                 btn.classList.add("held");
                 fetch(`/api/mouse/press?btn=${buttonName}&state=1`, { method: 'POST' });
             });
@@ -701,7 +728,7 @@ class ServerHandler(BaseHTTPRequestHandler):
             controller.click(btn)
             self._send_status(204)
 
-        # 5. Klávesnice (včetně šipek a mezerníku)
+        # 5. Klávesnice
         elif path == "/api/keyboard/key":
             key_name = params.get("key", [""])[0]
             if key_name:
@@ -753,7 +780,6 @@ class ServerHandler(BaseHTTPRequestHandler):
         self.wfile.write(html.encode("utf-8"))
 
     def log_message(self, format, *args):
-        # Filtruje logy pohybu a kolečka
         if len(args) > 0 and any(k in str(args[0]) for k in ["api/mouse/move", "api/mouse/wheel"]):
             return
         print(f"[HTTP] {self.address_string()} - {format % args}")
