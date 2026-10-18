@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import pwd
 import time
 import argparse
 import threading
@@ -8,10 +9,27 @@ from urllib.parse import urlparse, parse_qs
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 PORT = 1111
-USER = "cernytom"
-RUNTIME_DIR = "/run/user/1000"
 
-# KONTROLA PRÁV ROOT (bez sudo myš v Linuxu nefunguje!)
+# --- NAČTENÍ POUZE Z PROMĚNNÝCH PROSTŘEDÍ (BEZ NATVRDO ZAPSANÝCH HODNOT) ---
+USER = os.environ.get("RPI_USER")
+USER_UID = os.environ.get("RPI_UID")
+
+# Pokud proměnné nejsou nastaveny (např. při ručním spuštění přes sudo),
+# zjistí se skutečný uživatel a jeho UID dynamicky přímo ze systému:
+if not USER or not USER_UID:
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and sudo_user != "root":
+        USER = sudo_user
+        USER_UID = str(pwd.getpwnam(sudo_user).pw_uid)
+    else:
+        USER = os.environ.get("USER")
+        USER_UID = str(os.getuid())
+
+RUNTIME_DIR = f"/run/user/{USER_UID}"
+
+print(f"[CONFIG] Načtený uživatel: {USER} | UID: {USER_UID} | Runtime: {RUNTIME_DIR}")
+
+# Kontrola root oprávnění (nutné pro zápis do /dev/uinput)
 if os.getuid() != 0:
     print("\n" + "!" * 65)
     print(" [VAROVÁNÍ] Skript neběží pod SUDO!")
@@ -19,7 +37,7 @@ if os.getuid() != 0:
     print(" Spusťte skript příkazem:  sudo python3 " + os.path.basename(__file__))
     print("!" * 65 + "\n")
 
-# --- SPOLEHLIVÉ OVLÁDÁNÍ ZVUKU ---
+# --- OVLÁDÁNÍ ZVUKU ---
 def refresh_audio():
     for cmd in ["udevadm trigger --subsystem-match=sound", "alsactl restore"]:
         try:
@@ -27,6 +45,7 @@ def refresh_audio():
         except Exception:
             pass
 
+    # Šetrný restart WirePlumberu přes systemd daného uživatele
     try:
         cmd_wp = f"runuser -u {USER} -- env XDG_RUNTIME_DIR={RUNTIME_DIR} systemctl --user restart wireplumber"
         subprocess.run(cmd_wp, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -49,9 +68,10 @@ def refresh_audio():
                     break
 
         if hdmi_sink:
+            # Nastavení výchozího výstupu
             subprocess.run(f"{env_prefix} pactl set-default-sink {hdmi_sink}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
-            # Přesun běžících aplikací (např. VLC)
+            # Přesun běžících aplikací (např. VLC) do HDMI
             cmd_inputs = f"{env_prefix} pactl list sink-inputs short"
             res_inputs = subprocess.run(cmd_inputs, shell=True, capture_output=True, text=True)
             for line in res_inputs.stdout.strip().splitlines():
@@ -61,7 +81,7 @@ def refresh_audio():
                     subprocess.run(f"{env_prefix} pactl move-sink-input {input_id} {hdmi_sink}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             print(f"[AUDIO] Přepnuto na HDMI: {hdmi_sink}")
     except Exception as ex:
-        print(f"[AUDIO] Chyba při obnově: {ex}")
+        print(f"[AUDIO] Chyba při obnově audia: {ex}")
 
 def delayed_audio_refresh():
     time.sleep(5.0)
@@ -173,7 +193,7 @@ class MouseKeyboardController:
         self.ui = None
         if HAS_EVDEV:
             try:
-                # Nativní relativní myš (REL_X, REL_Y) - Wayland ji bere jako standardní USB myš
+                # Nativní relativní myš (REL_X, REL_Y) pro plynulý chod pod Waylandem
                 cap = {
                     e.EV_REL: [e.REL_X, e.REL_Y],
                     e.EV_KEY: VALID_KEY_CODES
@@ -182,7 +202,6 @@ class MouseKeyboardController:
                 print("[INPUT] Virtuální myš a klávesnice úspěšně vytvořena!")
             except Exception as ex:
                 print(f"[CHYBA INPUTU] Nelze otevřít evdev: {ex}")
-                print(" -> Běží skript s právy root (sudo)?")
 
     def move(self, dx: int, dy: int):
         if self.ui:
@@ -209,6 +228,7 @@ class MouseKeyboardController:
             self.ui.syn()
 
     def type_text(self, text: str):
+        # 1. Přednostně wtype pro Wayland
         cmd = [
             "runuser", "-u", USER, "--",
             "env", f"XDG_RUNTIME_DIR={RUNTIME_DIR}", "WAYLAND_DISPLAY=wayland-0",
@@ -222,6 +242,7 @@ class MouseKeyboardController:
         except Exception:
             pass
 
+        # 2. Záložně evdev
         if not self.ui:
             return
         for char in text:
@@ -449,7 +470,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             }
         }, { passive: false });
 
-        // Myš (PC test)
+        // Myš (pro test z PC)
         pad.addEventListener("mousedown", (e) => {
             isMouseDown = true;
             pad.classList.add("active");
@@ -593,6 +614,7 @@ class ServerHandler(BaseHTTPRequestHandler):
         self.wfile.write(html.encode("utf-8"))
 
     def log_message(self, format, *args):
+        # Filtruje logy pohybu myši
         if len(args) > 0 and "api/mouse" in str(args[0]):
             return
         print(f"[HTTP] {self.address_string()} - {format % args}")
