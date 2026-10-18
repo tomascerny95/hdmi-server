@@ -10,11 +10,11 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 PORT = 1111
 
-# --- NAČTENÍ POUZE Z PROMĚNNÝCH PROSTŘEDÍ (BEZ NATVRDO ZAPSANÝCH HODNOT) ---
+# --- DYNAMIC CONFIGURATION (LOADED VIA ENVIRONMENT VARIABLES) ---
 USER = os.environ.get("RPI_USER")
 USER_UID = os.environ.get("RPI_UID")
 
-# Pokud proměnné nejsou nastaveny, zjistí se dynamicky ze systému:
+# Fallback detection if executed manually outside systemd
 if not USER or not USER_UID:
     sudo_user = os.environ.get("SUDO_USER")
     if sudo_user and sudo_user != "root":
@@ -26,17 +26,17 @@ if not USER or not USER_UID:
 
 RUNTIME_DIR = f"/run/user/{USER_UID}"
 
-print(f"[CONFIG] Uživatel: {USER} | UID: {USER_UID} | Runtime: {RUNTIME_DIR}")
+print(f"[CONFIG] Active User: {USER} | UID: {USER_UID} | Runtime: {RUNTIME_DIR}")
 
-# Kontrola root oprávnění
+# Root check required for /dev/uinput access
 if os.getuid() != 0:
     print("\n" + "!" * 65)
-    print(" [VAROVÁNÍ] Skript neběží pod SUDO!")
-    print(" Linux nedovolí ovládat myš bez oprávnění root.")
-    print(" Spusťte skript příkazem:  sudo python3 " + os.path.basename(__file__))
+    print(" [WARNING] Script is not running under SUDO!")
+    print(" Linux prohibits virtual mouse creation without root permissions.")
+    print(" Run via: sudo python3 " + os.path.basename(__file__))
     print("!" * 65 + "\n")
 
-# --- OVLÁDÁNÍ ZVUKU ---
+# --- AUDIO MANAGEMENT ---
 def refresh_audio():
     for cmd in ["udevadm trigger --subsystem-match=sound", "alsactl restore"]:
         try:
@@ -66,8 +66,10 @@ def refresh_audio():
                     break
 
         if hdmi_sink:
+            # Set HDMI as default output sink
             subprocess.run(f"{env_prefix} pactl set-default-sink {hdmi_sink}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
+            # Transfer currently playing audio streams (e.g., VLC) to HDMI
             cmd_inputs = f"{env_prefix} pactl list sink-inputs short"
             res_inputs = subprocess.run(cmd_inputs, shell=True, capture_output=True, text=True)
             for line in res_inputs.stdout.strip().splitlines():
@@ -75,15 +77,15 @@ def refresh_audio():
                 if parts:
                     input_id = parts[0]
                     subprocess.run(f"{env_prefix} pactl move-sink-input {input_id} {hdmi_sink}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            print(f"[AUDIO] Přepnuto na HDMI: {hdmi_sink}")
+            print(f"[AUDIO] Switched to HDMI sink: {hdmi_sink}")
     except Exception as ex:
-        print(f"[AUDIO] Chyba při obnově audia: {ex}")
+        print(f"[AUDIO] Refresh failed: {ex}")
 
 def delayed_audio_refresh():
     time.sleep(5.0)
     refresh_audio()
 
-# --- OVLÁDÁNÍ HDMI ---
+# --- HDMI DISPLAY CONTROL ---
 def find_hdmi_status_path():
     default_path = "/sys/class/drm/card0-HDMI-A-1/status"
     if os.path.exists(default_path):
@@ -110,9 +112,9 @@ def get_hdmi_status() -> str:
         with open(HDMI_STATUS_PATH, "r") as f:
             return f.read().strip()
     except Exception:
-        return "neznámý"
+        return "unknown"
 
-# --- OVLÁDÁNÍ MYŠI A KLÁVESNICE ---
+# --- INPUT CONTROLLER (MOUSE & KEYBOARD) ---
 try:
     import evdev
     from evdev import UInput, ecodes as e
@@ -144,6 +146,7 @@ if HAS_EVDEV:
             CHAR_KEY_MAP[ch.upper()] = (key_code, True)
             VALID_KEY_CODES.append(key_code)
 
+    # QWERTZ / Standard layout compatibility
     CHAR_KEY_MAP['y'] = (e.KEY_Z, False)
     CHAR_KEY_MAP['Y'] = (e.KEY_Z, True)
     CHAR_KEY_MAP['z'] = (e.KEY_Y, False)
@@ -193,9 +196,9 @@ class MouseKeyboardController:
                     e.EV_KEY: VALID_KEY_CODES
                 }
                 self.ui = UInput(cap, name="RPi-Web-Remote-Mouse")
-                print("[INPUT] Virtuální myš a klávesnice úspěšně vytvořena!")
+                print("[INPUT] Virtual mouse and keyboard created successfully!")
             except Exception as ex:
-                print(f"[CHYBA INPUTU] Nelze otevřít evdev: {ex}")
+                print(f"[INPUT ERROR] Failed to initialize evdev: {ex}")
 
     def move(self, dx: int, dy: int):
         if self.ui:
@@ -260,13 +263,13 @@ class MouseKeyboardController:
 
 controller = MouseKeyboardController()
 
-# --- WEBOVÉ ROZHRANÍ ---
+# --- WEB UI TEMPLATE ---
 HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="cs">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <title>RPi Remote Touchpad</title>
+    <title>RPi TV Remote</title>
     <style>
         * { box-sizing: border-box; user-select: none; -webkit-user-select: none; }
         html, body {
@@ -320,7 +323,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .btn-kbd-key:active { background: #38bdf8; color: black; }
         .btn-arrow { font-size: 1.1rem; flex: 1; }
 
-        /* TOUCHPAD PLOCHA */
+        /* TOUCHPAD SURFACE */
         #touchpad {
             flex: 1 1 0;
             min-height: 0;
@@ -366,31 +369,31 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div class="header-top">
             <div class="status-badge">HDMI: __STATUS_TEXT__</div>
             <div class="top-tools">
-                <button class="btn-action btn-kbd" onclick="toggleKeyboard()">⌨️ Klávesnice</button>
-                <button class="btn-action btn-close" onclick="closeApp()">❌ Zavřít</button>
+                <button class="btn-action btn-kbd" onclick="toggleKeyboard()">⌨️ Keyboard</button>
+                <button class="btn-action btn-close" onclick="closeApp()">❌ Close</button>
             </div>
         </div>
         <div class="action-buttons">
-            <a href="/hdmi/on" class="btn-action btn-on">Zapnout TV</a>
-            <a href="/hdmi/off" class="btn-action btn-off">Vypnout TV</a>
-            <button class="btn-action btn-audio" id="btn-audio" onclick="triggerAudioRefresh()">🔊 Zvuk</button>
+            <a href="/hdmi/on" class="btn-action btn-on">Turn On TV</a>
+            <a href="/hdmi/off" class="btn-action btn-off">Turn Off TV</a>
+            <button class="btn-action btn-audio" id="btn-audio" onclick="triggerAudioRefresh()">🔊 Audio</button>
         </div>
 
         <div id="keyboard-panel">
             <form onsubmit="submitText(event)" class="kbd-row">
-                <input type="text" id="kbd-input" placeholder="Zde pište text do Raspberry..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
-                <button type="submit" class="btn-kbd-key" style="background:#0ea5e9;">Odeslat</button>
+                <input type="text" id="kbd-input" placeholder="Type text to send to Raspberry Pi..." autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
+                <button type="submit" class="btn-kbd-key" style="background:#0ea5e9;">Send</button>
             </form>
 
             <div class="kbd-row">
                 <button class="btn-kbd-key" style="flex:1;" onclick="sendKey('Esc')">Esc</button>
                 <button class="btn-kbd-key" style="flex:1;" onclick="sendKey('Tab')">Tab</button>
-                <button class="btn-kbd-key" style="flex:1.2;" onclick="sendKey('Backspace')">⌫ Smazat</button>
+                <button class="btn-kbd-key" style="flex:1.2;" onclick="sendKey('Backspace')">⌫ Backspace</button>
                 <button class="btn-kbd-key" style="flex:1.4; background:#16a34a;" onclick="sendKey('Enter')">↵ Enter</button>
             </div>
 
             <div class="kbd-row">
-                <button class="btn-kbd-key" style="flex:2.5;" onclick="sendKey('Space')">␣ Mezerník</button>
+                <button class="btn-kbd-key" style="flex:2.5;" onclick="sendKey('Space')">␣ Spacebar</button>
                 <button class="btn-kbd-key btn-arrow" onclick="sendKey('Left')">←</button>
                 <button class="btn-kbd-key btn-arrow" onclick="sendKey('Up')">↑</button>
                 <button class="btn-kbd-key btn-arrow" onclick="sendKey('Down')">↓</button>
@@ -399,18 +402,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
     </div>
 
-    <!-- TOUCHPAD PLOCHA -->
+    <!-- TOUCHPAD AREA -->
     <div id="touchpad">
         <div class="touchpad-hints">
-            <span>👆 1 prst / myš: Pohyb / Kliknutí</span><br>
-            <span>✌️ 2 prsty / kolečko: Kolečko myši (Scroll)</span><br>
-            <span>✊ 2× klepnout a táhnout: Přichycení okna</span>
+            <span>👆 1 finger / mouse: Move / Click</span><br>
+            <span>✌️ 2 fingers / wheel: Scroll</span><br>
+            <span>✊ Double-tap & drag: Move Window</span>
         </div>
     </div>
 
     <div class="mouse-buttons">
-        <button class="btn-mouse" id="btn-left">Levé tlačítko</button>
-        <button class="btn-mouse" id="btn-right">Pravé tlačítko</button>
+        <button class="btn-mouse" id="btn-left">Left Button</button>
+        <button class="btn-mouse" id="btn-right">Right Button</button>
     </div>
 
     <script>
@@ -433,7 +436,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         let lastTapTime = 0;
         let isDragging = false;
 
-        // Vypnutí kontextového menu Windows na ploše touchpadu
         pad.addEventListener("contextmenu", (e) => e.preventDefault());
         document.body.addEventListener("contextmenu", (e) => {
             if (e.target.closest('#touchpad, .mouse-buttons')) e.preventDefault();
@@ -491,19 +493,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
 
         function closeApp() {
-            if (confirm("Chcete stránku zavřít?")) {
+            if (confirm("Do you want to close the remote?")) {
                 window.open('', '_self', '');
                 window.close();
                 document.body.innerHTML = `
                     <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100dvh;color:#94a3b8;font-size:1.2rem;text-align:center;padding:20px;">
-                        <span>Aplikace byla ukončena.</span>
+                        <span>Remote closed.</span>
                     </div>`;
             }
         }
 
-        // --- 1. OVLÁDÁNÍ MYŠÍ Z PC (WINDOWS CHROME FIX) ---
+        // --- 1. MOUSE (PC / WINDOWS CHROME FIX) ---
         pad.addEventListener("mousedown", (e) => {
-            e.preventDefault(); // Zásadní: zabrání označování textu / blokaci tahu v Chrome na Windows
+            e.preventDefault();
             isMouseDown = true;
             pad.classList.add("active");
             lastX = e.clientX; lastY = e.clientY;
@@ -530,14 +532,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             }
         });
 
-        // PC Kolečko myši
         pad.addEventListener("wheel", (e) => {
             e.preventDefault();
             const step = e.deltaY < 0 ? 1 : -1;
             accScroll += (step * 20);
         }, { passive: false });
 
-        // --- 2. DOTYKOVÉ OVLÁDÁNÍ (MOBIL) ---
+        // --- 2. TOUCH GESTURES (MOBILE) ---
         pad.addEventListener("touchstart", (e) => {
             e.preventDefault();
 
@@ -611,7 +612,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             }
         }, { passive: false });
 
-        // --- 3. SPODNÍ TLAČÍTKA ---
+        // --- 3. BOTTOM BUTTONS ---
         function setupHoldButton(btnId, buttonName) {
             const btn = document.getElementById(btnId);
 
@@ -650,16 +651,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         function triggerAudioRefresh() {
             const btn = document.getElementById("btn-audio");
             const originalText = btn.innerText;
-            btn.innerText = "⏳ Obnovuji...";
+            btn.innerText = "⏳ Refreshing...";
             btn.disabled = true;
 
             fetch('/api/audio/refresh', { method: 'POST' })
                 .then(() => {
-                    btn.innerText = "✓ Zvuk OK";
+                    btn.innerText = "✓ Audio OK";
                     setTimeout(() => { btn.innerText = originalText; btn.disabled = false; }, 2000);
                 })
                 .catch(() => {
-                    btn.innerText = "Chyba";
+                    btn.innerText = "Error";
                     setTimeout(() => { btn.innerText = originalText; btn.disabled = false; }, 2000);
                 });
         }
@@ -668,7 +669,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </html>
 """
 
-# --- HTTP HANDLER ---
+# --- HTTP SERVER HANDLER ---
 class ServerHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -693,7 +694,6 @@ class ServerHandler(BaseHTTPRequestHandler):
         path = parsed.path
         params = parse_qs(parsed.query)
 
-        # 1. Pohyb myši
         if path == "/api/mouse/move":
             try:
                 dx = int(params.get("dx", [0])[0])
@@ -703,7 +703,6 @@ class ServerHandler(BaseHTTPRequestHandler):
             except Exception:
                 self._send_status(400)
 
-        # 2. Kolečko myši (Scroll)
         elif path == "/api/mouse/wheel":
             try:
                 dy = int(params.get("dy", [0])[0])
@@ -712,7 +711,6 @@ class ServerHandler(BaseHTTPRequestHandler):
             except Exception:
                 self._send_status(400)
 
-        # 3. Držení tlačítka (Přichycení)
         elif path == "/api/mouse/press":
             try:
                 btn = params.get("btn", ["left"])[0]
@@ -722,13 +720,11 @@ class ServerHandler(BaseHTTPRequestHandler):
             except Exception:
                 self._send_status(400)
 
-        # 4. Jednorázový klik
         elif path == "/api/mouse/click":
             btn = params.get("btn", ["left"])[0]
             controller.click(btn)
             self._send_status(204)
 
-        # 5. Klávesnice
         elif path == "/api/keyboard/key":
             key_name = params.get("key", [""])[0]
             if key_name:
@@ -768,7 +764,7 @@ class ServerHandler(BaseHTTPRequestHandler):
     def _serve_dashboard(self):
         status = get_hdmi_status()
         is_on = status.lower() in ["connected", "on", "enabled"]
-        status_text = "ZAPNUTO" if is_on else "VYPNUTO"
+        status_text = "ON" if is_on else "OFF"
         status_color = "#22c55e" if is_on else "#ef4444"
 
         html = HTML_TEMPLATE.replace("__STATUS_TEXT__", status_text).replace("__STATUS_COLOR__", status_color)
@@ -785,16 +781,16 @@ class ServerHandler(BaseHTTPRequestHandler):
         print(f"[HTTP] {self.address_string()} - {format % args}")
 
 def run_server(port):
-    print("[STARTUP] Automatické vypínání HDMI monitoru...")
+    print("[STARTUP] Turning off HDMI display...")
     set_hdmi(False)
 
     server_address = ("", port)
     httpd = ThreadingHTTPServer(server_address, ServerHandler)
-    print(f"[SERVER] Běží na portu {port}")
+    print(f"[SERVER] Running on port {port}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\n[SERVER] Zastaven.")
+        print("\n[SERVER] Stopped.")
         httpd.server_close()
 
 if __name__ == "__main__":

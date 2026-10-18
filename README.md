@@ -1,71 +1,42 @@
-# HDMI Web Controller
+# rpi-tv-remote
 
-A lightweight, headless HDMI controller server optimized for Raspberry Pi and Linux, designed to remotely manage HDMI display power states directly via a web browser.
+A lightweight, ultra-responsive web-based TV remote control for Raspberry Pi (compatible with Wayland and PipeWire). Turn your smartphone, tablet, or secondary PC into a seamless touchpad, on-screen keyboard, HDMI display switch, and audio manager.
 
----
-
-## Overview
-
-HDMI Web Controller provides a minimalist web dashboard to power on and off HDMI outputs on Linux systems. It acts as an ultra-low-footprint remote switch for TVs and monitors connected to a Raspberry Pi or home server, completely avoiding heavy desktop environments, complex dependencies, or background databases.
-
-### Key Components
-
-- **Web Dashboard (Port 1111):** Pure Python HTTP service delivering an instant responsive web interface to control display status.
-- **Direct DRM Sysfs Control:** Communicates directly with the Linux kernel Direct Rendering Manager (`/sys/class/drm/card0-HDMI-A-1/status`) without relying on X11 or Wayland display servers.
-- **Systemd Background Service:** Runs directly in-place from your cloned repository directory with automatic restart on boot.
+GitHub Repository: [https://github.com/tomascerny95/rpi-tv-remote](https://github.com/tomascerny95/rpi-tv-remote)
 
 ---
 
 ## Features
 
-- **Zero External Dependencies:** Built entirely with standard Python 3 (`http.server`, `subprocess`) — no `pip`, Flask, or external libraries required.
-- **Run In-Place:** Runs directly from your user directory (e.g. `/home/cernytom/hdmi-server`) without moving files to system paths.
-- **Auto-User Detection:** Installation script automatically detects the calling user and working directory, configuring systemd dynamically.
-- **Direct Kernel Level Control:** Toggles display power via `/sys/class/drm/.../status`, ensuring compatibility even in headless setups.
-- **Instant Response & Clean Redirects:** Action endpoints automatically redirect back to the control dashboard via HTTP 303.
-- **Minimal Footprint:** Uses less than 15 MB of RAM and near 0% CPU, making it ideal for 24/7 Raspberry Pi devices.
+- **Touchpad Navigation**: Smooth relative mouse pointer (`EV_REL`) with zero lag.
+- **Two-Finger Scroll**: Vertical scrolling (mouse wheel simulation) with two-finger swipe or physical PC mouse wheel.
+- **Drag & Drop**: Double-tap and drag, or hold down the Left Button to drag windows and files.
+- **On-Screen Keyboard**: Full typing with diacritics (`wtype`), QWERTZ / Standard layout compatibility, Esc, Tab, Backspace, Enter, Spacebar, and Navigation Arrows (← ↑ ↓ →).
+- **HDMI Power Management**: Easily toggle HDMI TV/monitor power on and off via DRM sysfs.
+- **PipeWire Audio Recovery**: Automatically routes sound to HDMI and migrates active media streams (e.g., VLC) to HDMI after waking up the TV.
+- **100% Dynamic Setup**: Zero hardcoded usernames or UIDs. Works on any user account out of the box.
 
 ---
 
-## Architecture & Ports
+## Quick Installation & Updates
 
-| Service | Port / Path | Description |
-| :--- | :--- | :--- |
-| **HDMI Web Server** | `1111` | Responsive web dashboard and control endpoints |
-| **Hardware Interface** | `/sys/class/drm/card0-HDMI-A-1/status` | Linux kernel DRM sysfs interface for HDMI output |
+### 1. Initial Installation
+Clone this repository to your Raspberry Pi and execute the setup script:
 
----
-
-## Prerequisites
-
-- Debian / Ubuntu / Raspberry Pi OS
-- Python 3.8+
-- Sudo privileges for running the installer
-
----
-
-## Quick Installation
-
-1. **Clone the repository:**
 ```bash
-git clone https://github.com/tomascerny95/hdmi-server.git
-cd hdmi-server
-```
-
-2. **Run the automated setup script:**
-```bash
+git clone https://github.com/tomascerny95/rpi-tv-remote.git
+cd rpi-tv-remote
 chmod +x setup_hdmi_server.sh
 sudo ./setup_hdmi_server.sh
 ```
 
-3. **Access the web interface:**
-   - **HDMI Dashboard:** `http://<YOUR_PI_IP>:1111`
+Open your browser on your phone or PC:
+```text
+http://<YOUR_PI_IP>:1111
+```
 
----
-
-## Updating
-
-To pull the latest updates from GitHub and automatically reconfigure the service:
+### 2. One-Line Clean Update Command
+To pull the latest changes, cleanly reset your working branch, and execute the installer in a single command:
 
 ```bash
 git fetch origin && git reset --hard origin/main && sudo bash ./setup_hdmi_server.sh
@@ -73,43 +44,60 @@ git fetch origin && git reset --hard origin/main && sudo bash ./setup_hdmi_serve
 
 ---
 
-## Manual Execution
+## Recommended System & VLC Configuration
 
-You can also run the server directly from the folder without systemd:
+To prevent HDMI audio dropouts, periodic muting, or buffer desynchronization during media playback, apply the following two tweaks:
+
+### A. Disable HDMI Audio Idle Suspension (PipeWire / WirePlumber)
+By default, Raspberry Pi OS suspends idle ALSA sinks after a few seconds of silence, causing TVs to lose HDMI audio synchronization. Disable it with:
 
 ```bash
-# Run with default port (1111)
-sudo python3 hdmi_server.py
-
-# Run on a custom port
-sudo python3 hdmi_server.py --port 8080
-
-# Turn HDMI off immediately on server start
-sudo python3 hdmi_server.py --init-off
+mkdir -p ~/.config/wireplumber/wireplumber.conf.d/
+cat << 'EOF' > ~/.config/wireplumber/wireplumber.conf.d/51-disable-suspension.conf
+monitor.alsa.rules = [
+  {
+    matches = [
+      {
+        node.name = "~alsa_output.*"
+      }
+    ]
+    actions = {
+      update-props = {
+        session.suspend-timeout-seconds = 0
+      }
+    }
+  }
+]
+EOF
+systemctl --user restart wireplumber
 ```
 
----
-
-## Project Structure
-
-```text
-hdmi-server/
-├── hdmi_server.py           # Core Python HTTP server and DRM controller
-├── setup_hdmi_server.sh     # Automated installation and systemd deployment script
-├── README.md                # Project documentation
-└── LICENSE                  # Open source license
-```
-
----
-
-## Endpoints
-
-- `GET /` - Main web dashboard with interactive HDMI ON / OFF buttons.
-- `GET /hdmi/on` - Triggers HDMI display activation and redirects back to `/`.
-- `GET /hdmi/off` - Powers down the HDMI display output and redirects back to `/`.
+### B. Configure VLC Media Player
+1. Open VLC on your Raspberry Pi: **Tools → Preferences** (`Ctrl + P`).
+2. Go to **Audio** settings:
+   - Change **Output module** from *Automatic* to: **PulseAudio audio output**.
+3. At the bottom-left, change **Show settings** from *Simple* to **All**.
+4. In the left panel, navigate to **Input / Codecs**:
+   - Scroll down to the **Advanced** section.
+   - Set **File caching (ms)** to: `1000`.
+   - Set **Network caching (ms)** to: `1500`.
+5. Click **Save** and restart VLC.
 
 ---
 
-## License
+## Service Management
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+The remote control server runs as a systemd service (`hdmi-server.service`):
+
+- **Status check**:
+  ```bash
+  sudo systemctl status hdmi-server.service
+  ```
+- **Live log output**:
+  ```bash
+  sudo journalctl -u hdmi-server.service -f
+  ```
+- **Restart service**:
+  ```bash
+  sudo systemctl restart hdmi-server.service
+  ```
