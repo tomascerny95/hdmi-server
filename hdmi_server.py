@@ -20,8 +20,8 @@ def detect_desktop_resolution():
         cmd = [
             "runuser", "-u", USER, "--",
             "env", f"XDG_RUNTIME_DIR={RUNTIME_DIR}", "WAYLAND_DISPLAY=wayland-0",
-            "grim", "-s", "1", temp
-        ] if os.getuid() == 0 else ["grim", "-s", "1", temp]
+            "grim", temp
+        ] if os.getuid() == 0 else ["grim", temp]
         
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
         if os.path.exists(temp):
@@ -88,10 +88,6 @@ def delayed_audio_refresh():
     time.sleep(5.0)
     refresh_audio()
 
-def delayed_screen_refresh():
-    time.sleep(5.0)
-    controller.center()
-
 # --- OVLÁDÁNÍ HDMI ---
 def find_hdmi_status_path():
     default_path = "/sys/class/drm/card0-HDMI-A-1/status"
@@ -109,7 +105,6 @@ def set_hdmi(enable: bool) -> bool:
         with open(HDMI_STATUS_PATH, "w") as f:
             f.write(state_str + "\n")
         if enable:
-            threading.Thread(target=delayed_screen_refresh, daemon=True).start()
             threading.Thread(target=delayed_audio_refresh, daemon=True).start()
         return True
     except Exception:
@@ -122,7 +117,7 @@ def get_hdmi_status() -> str:
     except Exception:
         return "neznámý"
 
-# --- OVLÁDÁNÍ MYŠI A KLÁVESNICE ---
+# --- OVLÁDÁNÍ MYŠI A KLÁVESNICE (PŮVODNÍ FUNKČNÍ ŘEŠENÍ) ---
 try:
     import evdev
     from evdev import UInput, ecodes as e
@@ -198,7 +193,6 @@ class AbsoluteInputController:
         self.ui = None
         if HAS_EVDEV:
             try:
-                # Rozsah přesně odpovídá pixelům plochy – resolution=1 unit/pixel pro 1:1 mapování
                 cap = {
                     e.EV_ABS: [
                         (e.ABS_X, evdev.AbsInfo(value=cur_x, min=0, max=screen_width - 1, fuzz=0, flat=0, resolution=1)),
@@ -231,7 +225,6 @@ class AbsoluteInputController:
             cur_x = screen_width // 2
             cur_y = screen_height // 2
         self.sync()
-        print(f"[INPUT] Myš vycentrována na: {cur_x}, {cur_y}")
 
     def click(self, button: str = "left"):
         if self.ui:
@@ -319,8 +312,8 @@ def capture_screen(req_w, req_h):
     cmd = [
         "runuser", "-u", USER, "--",
         "env", f"XDG_RUNTIME_DIR={RUNTIME_DIR}", "WAYLAND_DISPLAY=wayland-0",
-        "grim", "-s", "1", "-c", "-g", geom, temp_raw
-    ] if os.getuid() == 0 else ["grim", "-s", "1", "-c", "-g", geom, temp_raw]
+        "grim", "-c", "-g", geom, temp_raw
+    ] if os.getuid() == 0 else ["grim", "-c", "-g", geom, temp_raw]
 
     try:
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1)
@@ -578,7 +571,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        // Dotykové ovládání: tažení = posun touchpadu, krátké klepnutí = přímý skok na prvek a klik
+        // Dotykové ovládání (mobil)
         pad.addEventListener("touchstart", (e) => {
             e.preventDefault();
             pad.classList.add("active");
@@ -600,22 +593,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             e.preventDefault();
             pad.classList.remove("active");
             const dist = Math.hypot(lastX - startX, lastY - startY);
-            
-            // Krátké ťuknutí na konkrétní místo: skočí přímo tam a klikne
-            if (dist < 10 && (Date.now() - startTime) < 300) {
-                const rect = pad.getBoundingClientRect();
-                const tapX = startX - rect.left;
-                const tapY = startY - rect.top;
-                const offsetX = Math.round(tapX - rect.width / 2);
-                const offsetY = Math.round(tapY - rect.height / 2);
-                fetch('/api/mouse/click_at?dx=' + offsetX + '&dy=' + offsetY + '&btn=left', { method: 'POST' })
-                    .then(() => setTimeout(updateScreen, 60));
-            } else {
-                setTimeout(updateScreen, 40);
+            if (dist < 8 && (Date.now() - startTime) < 250) {
+                sendClick('left');
             }
+            setTimeout(updateScreen, 40);
         }, { passive: false });
 
-        // Myš (pro testování na PC)
+        // Myš (PC)
         pad.addEventListener("mousedown", (e) => {
             isMouseDown = true;
             pad.classList.add("active");
@@ -637,16 +621,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             pad.classList.remove("active");
             const dist = Math.hypot(lastX - startX, lastY - startY);
             if (dist < 8 && (Date.now() - startTime) < 250) {
-                const rect = pad.getBoundingClientRect();
-                const tapX = startX - rect.left;
-                const tapY = startY - rect.top;
-                const offsetX = Math.round(tapX - rect.width / 2);
-                const offsetY = Math.round(tapY - rect.height / 2);
-                fetch('/api/mouse/click_at?dx=' + offsetX + '&dy=' + offsetY + '&btn=left', { method: 'POST' })
-                    .then(() => setTimeout(updateScreen, 60));
-            } else {
-                setTimeout(updateScreen, 40);
+                sendClick('left');
             }
+            setTimeout(updateScreen, 40);
         });
 
         function sendClick(btn) {
@@ -726,18 +703,6 @@ class ServerHandler(BaseHTTPRequestHandler):
                 dx = int(params.get("dx", [0])[0])
                 dy = int(params.get("dy", [0])[0])
                 controller.move(dx, dy)
-                self._send_status(204)
-            except Exception:
-                self._send_status(400)
-
-        elif path == "/api/mouse/click_at":
-            try:
-                dx = int(params.get("dx", [0])[0])
-                dy = int(params.get("dy", [0])[0])
-                btn = params.get("btn", ["left"])[0]
-                controller.move(dx, dy)
-                time.sleep(0.01)
-                controller.click(btn)
                 self._send_status(204)
             except Exception:
                 self._send_status(400)
