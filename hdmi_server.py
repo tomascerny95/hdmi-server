@@ -41,30 +41,60 @@ pos_lock = threading.Lock()
 
 # --- OVLÁDÁNÍ ZVUKU ---
 def refresh_audio():
-    commands = [
-        "udevadm trigger --subsystem-match=sound",
-        "alsactl init",
-        "alsactl restore",
-        f"runuser -u {USER} -- pkill -x wireplumber",
-        f"runuser -u {USER} -- pkill -x pipewire",
-        f"runuser -u {USER} -- pulseaudio -k"
-    ]
-    for cmd in commands:
+    # 1. Obnova udev a ALSA bez zabíjení běžících zvukových démonů
+    for cmd in ["udevadm trigger --subsystem-match=sound", "alsactl restore"]:
         try:
             subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
+
+    # 2. Šetrný restart WirePlumberu přes systemd (PipeWire zůstane běžet -> lišta a ovládání zvuku nezmizí)
     try:
-        cmd_sink = f"runuser -u {USER} -- env XDG_RUNTIME_DIR={RUNTIME_DIR} pactl list sinks short | grep -i hdmi | head -n 1 | awk '{{print $2}}'"
-        res = subprocess.run(cmd_sink, shell=True, capture_output=True, text=True)
-        hdmi_sink = res.stdout.strip()
-        if hdmi_sink:
-            subprocess.run(f"runuser -u {USER} -- env XDG_RUNTIME_DIR={RUNTIME_DIR} pactl set-default-sink {hdmi_sink}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cmd_wp = f"runuser -u {USER} -- env XDG_RUNTIME_DIR={RUNTIME_DIR} systemctl --user restart wireplumber"
+        subprocess.run(cmd_wp, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
-def delayed_audio_refresh():
+    # 3. Krátká prodleva pro načtení koncových bodů (endpoints) WirePlumberem
     time.sleep(1.5)
+
+    try:
+        env_prefix = f"runuser -u {USER} -- env XDG_RUNTIME_DIR={RUNTIME_DIR}"
+        
+        # Zjištění názvu HDMI sinku
+        cmd_sink = f"{env_prefix} pactl list sinks short"
+        res = subprocess.run(cmd_sink, shell=True, capture_output=True, text=True)
+        
+        hdmi_sink = None
+        for line in res.stdout.strip().splitlines():
+            if "hdmi" in line.lower():
+                parts = line.split()
+                if len(parts) >= 2:
+                    hdmi_sink = parts[1]
+                    break
+
+        if hdmi_sink:
+            # Nastavit HDMI jako výchozí výstup pro nové aplikace
+            subprocess.run(f"{env_prefix} pactl set-default-sink {hdmi_sink}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            # PŘESUN BĚŽÍCÍCH STREAMŮ (např. hrající VLC):
+            # Přesměruje všechny právě přehrávané audio streamy přímo do HDMI
+            cmd_inputs = f"{env_prefix} pactl list sink-inputs short"
+            res_inputs = subprocess.run(cmd_inputs, shell=True, capture_output=True, text=True)
+            for line in res_inputs.stdout.strip().splitlines():
+                parts = line.split()
+                if parts:
+                    input_id = parts[0]
+                    subprocess.run(f"{env_prefix} pactl move-sink-input {input_id} {hdmi_sink}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"[AUDIO] Úspěšně přepnuto na HDMI: {hdmi_sink}")
+        else:
+            print("[AUDIO] HDMI sink nebyl detekován.")
+    except Exception as ex:
+        print(f"[AUDIO] Chyba při obnově audia: {ex}")
+
+def delayed_audio_refresh():
+    # Čekání 10 sekund na probuzení TV/monitoru a ustálení HDMI spojení
+    time.sleep(10.0)
     refresh_audio()
 
 # --- OVLÁDÁNÍ HDMI ---
@@ -609,6 +639,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             fetch('/api/audio/refresh', { method: 'POST' })
                 .then(() => {
                     btn.innerText = "✓ Obnoveno";
+                    setTimeout(() => { btn.innerText = originalText; btn.disabled = false; }, 2000);
+                })
+                .catch(() => {
+                    btn.innerText = "Chyba";
                     setTimeout(() => { btn.innerText = originalText; btn.disabled = false; }, 2000);
                 });
         }
